@@ -1,0 +1,100 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mioXpektron"
+version = "0.0.2"
+description = "A comprehensive Time-of-Flight Secondary Ion Mass Spectrometry (ToF-SIMS) data processing toolkit"
+readme = "README.md"
+requires-python = ">=3.8"
+license = "MIT"
+authors = [
+    {name = "Data Analysis Team @KaziLab.se", email = "mioxpektron@kazilab.se"}
+]
+maintainers = [
+    {name = "Data Analysis Team @KaziLab.se", email = "mioxpektron@kazilab.se"}
+]
+keywords = [
+    "mass-spectrometry",
+    "tof-sims",
+    "signal-processing",
+    "denoising",
+    "baseline-correction",
+    "peak-detection",
+    "calibration",
+    "scientific-computing"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "numpy>=1.20.0",
+    "pandas>=1.3.0",
+    "polars>=0.18.0",
+    "scipy>=1.7.0",
+    "matplotlib>=3.4.0",
+    "PyWavelets>=1.1.0",
+    "pybaselines>=1.0.0",
+    "scikit-learn>=1.0.0",
+    "joblib>=1.0.0",
+    "tqdm>=4.60.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=3.0",
+    "black>=22.0",
+    "isort>=5.0",
+    "mypy>=0.990",
+    "ruff>=0.1.0",
+]
+docs = [
+    "sphinx>=7.0",
+    "sphinx-rtd-theme>=2.0",
+    "myst-parser>=2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/kazilab/mioXpektron"
+Documentation = "https://mioxpektron.readthedocs.io/"
+Repository = "https://github.com/kazilab/mioXpektron"
+Issues = "https://github.com/kazilab/mioXpektron/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mioXpektron*"]
+exclude = ["mioXpektron.recalibrate._deprecated*"]
+
+[tool.setuptools.package-data]
+mioXpektron = ["py.typed", "**/*.md"]
+
+[tool.black]
+line-length = 88
+target-version = ['py38', 'py39', 'py310', 'py311']
+
+[tool.isort]
+profile = "black"
+line_length = 88
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+
+[tool.pytest.ini_options]
+testpaths = ["mioXpektron"]
+python_files = ["test_*.py"]
+addopts = "-v --cov=mioXpektron --cov-report=term-missing"

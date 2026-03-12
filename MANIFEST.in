@@ -1,0 +1,13 @@
+include README.md
+include LICENSE
+include pyproject.toml
+
+recursive-include mioXpektron *.md
+recursive-include mioXpektron py.typed
+
+recursive-exclude mioXpektron *_deprecated*
+recursive-exclude mioXpektron __pycache__
+recursive-exclude mioXpektron *.pyc
+recursive-exclude mioXpektron *.pyo
+recursive-exclude mioXpektron .DS_Store
+recursive-exclude mioXpektron .pytest_cache
