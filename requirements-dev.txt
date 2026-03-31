@@ -1,0 +1,13 @@
+# Development and testing
+-r requirements.txt
+pytest>=7.0
+pytest-cov>=3.0
+black>=22.0
+isort>=5.0
+mypy>=0.990
+ruff>=0.1.0
+
+# Documentation
+sphinx>=7.0
+sphinx-rtd-theme>=2.0
+myst-parser>=2.0
