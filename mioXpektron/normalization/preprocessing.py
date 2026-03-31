@@ -10,11 +10,109 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import polars as pl
+from scipy.interpolate import Akima1DInterpolator, CubicSpline, PchipInterpolator
 
 logger = logging.getLogger(__name__)
 
 from ..utils.file_management import import_data
 from .normalization import tic_normalization
+
+_RESAMPLE_METHODS = ("linear", "pchip", "akima", "makima", "cubic")
+
+
+def _build_akima_interpolator(mz_values, intensity_values, method):
+    """Build an Akima-family interpolator across SciPy versions."""
+    if method == "makima":
+        try:
+            return Akima1DInterpolator(
+                mz_values,
+                intensity_values,
+                method="makima",
+                extrapolate=False,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "resample method 'makima' requires scipy>=1.13.0."
+            ) from exc
+
+    try:
+        return Akima1DInterpolator(
+            mz_values,
+            intensity_values,
+            extrapolate=False,
+        )
+    except TypeError:
+        return Akima1DInterpolator(mz_values, intensity_values)
+
+
+def resample_spectrum(mz_values, intensity_values, target_mz, method="linear"):
+    """Resample a spectrum onto a target m/z grid.
+
+    The input axis is sorted, duplicate m/z positions are collapsed to their
+    first occurrence, and values outside the native m/z range are filled with
+    zero. Supported interpolation methods are ``linear``, ``pchip``,
+    ``akima``, ``makima``, and ``cubic``.
+    """
+    mz_values = np.asarray(mz_values, dtype=float).reshape(-1)
+    intensity_values = np.asarray(intensity_values, dtype=float).reshape(-1)
+    target_mz = np.asarray(target_mz, dtype=float)
+
+    if mz_values.size != intensity_values.size:
+        raise ValueError(
+            "mz_values and intensity_values must have the same length."
+        )
+    if mz_values.size == 0:
+        return np.zeros_like(target_mz, dtype=float)
+
+    order = np.argsort(mz_values)
+    mz_values = mz_values[order]
+    intensity_values = intensity_values[order]
+
+    mz_values, unique_idx = np.unique(mz_values, return_index=True)
+    intensity_values = intensity_values[unique_idx]
+
+    if method == "linear" or mz_values.size == 1:
+        resampled = np.interp(
+            target_mz,
+            mz_values,
+            intensity_values,
+            left=0.0,
+            right=0.0,
+        )
+        return np.asarray(resampled, dtype=float)
+
+    if method == "pchip":
+        interpolator = PchipInterpolator(
+            mz_values,
+            intensity_values,
+            extrapolate=False,
+        )
+    elif method in {"akima", "makima"}:
+        interpolator = _build_akima_interpolator(
+            mz_values,
+            intensity_values,
+            method,
+        )
+    elif method == "cubic":
+        interpolator = CubicSpline(
+            mz_values,
+            intensity_values,
+            extrapolate=False,
+        )
+    else:
+        valid_methods = ", ".join(_RESAMPLE_METHODS)
+        raise ValueError(
+            f"Unknown resample_method={method!r}. Use one of: {valid_methods}."
+        )
+
+    resampled = interpolator(target_mz)
+    resampled = np.nan_to_num(resampled, nan=0.0, posinf=0.0, neginf=0.0)
+    outside = (target_mz < mz_values[0]) | (target_mz > mz_values[-1])
+    resampled = np.where(outside, 0.0, resampled)
+    resampled = np.clip(resampled, 0.0, None)
+
+    return np.asarray(resampled, dtype=float)
+
 
 def data_preprocessing(
         file_path,

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -126,10 +125,9 @@ class NormalizationMethods:
         fig.tight_layout()
 
         if save_plot:
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             for ext in (".png", ".pdf"):
                 fig.savefig(
-                    OUTPUT_DIR / f"norm_compare_{sample_name}_{ts}{ext}",
+                    OUTPUT_DIR / f"norm_compare_{sample_name}{ext}",
                     bbox_inches="tight", dpi=300,
                 )
 
@@ -250,8 +248,7 @@ class NormalizationMethods:
         evaluator.print_summary()
 
         if save_results:
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            out_path = OUTPUT_DIR / f"normalization_eval_{ts}.xlsx"
+            out_path = OUTPUT_DIR / "normalization_eval.xlsx"
             results.to_excel(out_path, index=False)
             logger.info("Results saved to: %s", out_path)
 

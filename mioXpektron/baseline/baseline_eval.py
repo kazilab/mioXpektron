@@ -3,13 +3,11 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from datetime import datetime
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import json
 import warnings
 from collections import Counter
-from datetime import datetime
 
 import numpy as np
 
@@ -42,7 +40,13 @@ def _expand_methods(methods: Optional[Iterable[str]], param_grid: Optional[Dict[
     Returns two parallel lists: labels, call_specs, where each element in
     call_specs is (method_name, kwargs_dict).
     """
-    all_methods = methods or baseline_method_names()
+    if methods is not None:
+        all_methods = list(methods)
+    elif param_grid:
+        # A supplied parameter grid is usually intended to define the candidate set.
+        all_methods = list(param_grid.keys())
+    else:
+        all_methods = baseline_method_names()
     labels, specs = [], []
     for m in all_methods:
         grids = (param_grid or {}).get(m, [dict()])
@@ -51,6 +55,15 @@ def _expand_methods(methods: Optional[Iterable[str]], param_grid: Optional[Dict[
             labels.append(label)
             specs.append((m, k))
     return labels, specs
+
+
+def _spec_payload(label: str, spec: Tuple[str, Dict]) -> Dict[str, object]:
+    method, kwargs = spec
+    return {
+        "label": label,
+        "method": method,
+        "kwargs": dict(kwargs),
+    }
 
 
 def _row_ranks(values: np.ndarray, ascending: bool) -> np.ndarray:
@@ -106,7 +119,7 @@ class BaselineMethodEvaluator:
     topk_for_snr: int = 5
     raw_noise_quantile: float = 0.2  # bottom q region considered 'baseline-only'
     flat_windows: Optional[List[Tuple[float, float]]] = None  # m/z ranges known to be baseline-only
-    metrics_for_composite: Tuple[str, ...] = ("rfzn", "rfzn", "nar", "nar", "snr", "bbi", "bbi", "br", "nbc")
+    metrics_for_composite: Tuple[str, ...] = ("rfzn", "nar", "snr", "bbi", "br", "nbc")
     n_jobs: int = -1
 
     labels: List[str] = field(default_factory=list, init=False)
@@ -136,6 +149,7 @@ class BaselineMethodEvaluator:
             else:
                 self.param_grid = small_param_grid_preset()
         self.labels, self.specs = _expand_methods(self.methods, self.param_grid)
+        self._label_to_spec = {label: spec for label, spec in zip(self.labels, self.specs)}
 
     def _expand_files(self, candidates: Iterable[Union[str, Path]]) -> List[Path]:
         paths: List[Path] = []
@@ -256,7 +270,7 @@ class BaselineMethodEvaluator:
         rank_rfzn = _row_ranks(rfzn_arr, ascending=True)
         rank_nar  = _row_ranks(nar_arr,  ascending=True)
         rank_snr  = _row_ranks(snr_arr,  ascending=False)
-        rank_bbi  = _row_ranks(bbi_arr,  ascending=True)
+        rank_bbi  = _row_ranks(np.abs(bbi_arr),  ascending=True)
         rank_br   = _row_ranks(br_arr,   ascending=True)
         rank_nbc  = _row_ranks(nbc_arr,  ascending=True)
 
@@ -286,11 +300,21 @@ class BaselineMethodEvaluator:
             (label for label, val in ordered_pairs if np.isfinite(val)),
             ordered_pairs[0][0] if ordered_pairs else None,
         )
+        best_spec_payload = (
+            _spec_payload(overall_best, self._label_to_spec[overall_best])
+            if overall_best in self._label_to_spec
+            else None
+        )
+        ordered_specs = [
+            _spec_payload(label, self._label_to_spec[label])
+            for label, _ in ordered_pairs
+            if label in self._label_to_spec
+        ]
 
         rfzn_winners = _metric_winners(rfzn_arr, self.labels, minimize=True)
         nar_winners  = _metric_winners(nar_arr,  self.labels, minimize=True)
         snr_winners  = _metric_winners(snr_arr,  self.labels, minimize=False)
-        bbi_winners  = _metric_winners(bbi_arr,  self.labels, minimize=True)
+        bbi_winners  = _metric_winners(np.abs(bbi_arr),  self.labels, minimize=True)
         br_winners   = _metric_winners(br_arr,   self.labels, minimize=True)
         nbc_winners  = _metric_winners(nbc_arr,  self.labels, minimize=True)
 
@@ -314,7 +338,9 @@ class BaselineMethodEvaluator:
 
         summary = {
             "overall_best_method": overall_best,
+            "overall_best_spec": best_spec_payload,
             "overall_order": {label: float(val) if np.isfinite(val) else float("nan") for label, val in ordered_pairs},
+            "overall_order_specs": ordered_specs,
             "win_counts": {metric: {label: int(counter.get(label, 0)) for label in self.labels}
                             for metric, counter in win_counters.items()},
             "metrics_for_composite": list(self.metrics_for_composite),
@@ -331,6 +357,8 @@ class BaselineMethodEvaluator:
         self._overall_order = overall_order
         self._overall_order_methods = [label for label, _ in ordered_pairs]
         self._overall_best = overall_best
+        self._overall_best_spec = best_spec_payload
+        self._overall_order_specs = ordered_specs
         self._win_counts = win_counts
         self._warnings = warning_log
         return summary
@@ -361,7 +389,6 @@ class BaselineMethodEvaluator:
         if not hasattr(self, "_rfzn"):
             raise RuntimeError("Call evaluate() before plotting.")
         self._pub_style()
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_dir = OUTPUT_DIR / Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         saved = []
@@ -386,7 +413,7 @@ class BaselineMethodEvaluator:
             plt.xticks(rotation=45, ha="right")
             plt.tight_layout()
             for ext in (".pdf", ".png"):
-                p = out_dir / f"{fname}_{timestamp}{ext}"
+                p = out_dir / f"{fname}{ext}"
                 plt.savefig(p, bbox_inches="tight")
                 saved.append(p)
             plt.close()
@@ -413,7 +440,7 @@ class BaselineMethodEvaluator:
         plt.title("Total win counts (RFZN, NAR, SNR, BBI, BR, NBC)")
         plt.tight_layout()
         for ext in (".pdf", ".png"):
-            p = out_dir / f"win_counts_total_{timestamp}{ext}"; plt.savefig(p, bbox_inches="tight"); saved.append(p)
+            p = out_dir / f"win_counts_total{ext}"; plt.savefig(p, bbox_inches="tight"); saved.append(p)
         plt.close()
 
         # Overall composite ranking bar
@@ -427,22 +454,24 @@ class BaselineMethodEvaluator:
         plt.title("Overall baseline method ranking")
         plt.tight_layout()
         for ext in (".pdf", ".png"):
-            p = out_dir / f"overall_ranking_{timestamp}{ext}"; plt.savefig(p, bbox_inches="tight"); saved.append(p)
+            p = out_dir / f"overall_ranking{ext}"; plt.savefig(p, bbox_inches="tight"); saved.append(p)
         plt.close()
 
         # Export numeric results
-        self._rfzn.write_csv(out_dir / f"rfzn_by_file_{timestamp}.csv")
-        self._nar.write_csv(out_dir / f"nar_by_file_{timestamp}.csv")
-        self._snr.write_csv(out_dir / f"snr_by_file_{timestamp}.csv")
-        self._bbi.write_csv(out_dir / f"bbi_by_file_{timestamp}.csv")
-        self._br.write_csv(out_dir / f"br_by_file_{timestamp}.csv")
-        self._nbc.write_csv(out_dir / f"nbc_by_file_{timestamp}.csv")
-        self._comp.write_csv(out_dir / f"composite_rank_by_file_{timestamp}.csv")
-        self._win_counts.write_csv(out_dir / f"win_counts_by_metric_{timestamp}.csv")
-        with open(out_dir / f"summary_{timestamp}.json", "w", encoding="utf-8") as f:
+        self._rfzn.write_csv(out_dir / "rfzn_by_file.csv")
+        self._nar.write_csv(out_dir / "nar_by_file.csv")
+        self._snr.write_csv(out_dir / "snr_by_file.csv")
+        self._bbi.write_csv(out_dir / "bbi_by_file.csv")
+        self._br.write_csv(out_dir / "br_by_file.csv")
+        self._nbc.write_csv(out_dir / "nbc_by_file.csv")
+        self._comp.write_csv(out_dir / "composite_rank_by_file.csv")
+        self._win_counts.write_csv(out_dir / "win_counts_by_metric.csv")
+        with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
             json.dump({
                 "overall_best_method": self._overall_best,
+                "overall_best_spec": self._overall_best_spec,
                 "overall_order": {m: float(v) for m, v in zip(methods, values)},
+                "overall_order_specs": self._overall_order_specs,
                 "metrics_for_composite": list(self.metrics_for_composite)
             }, f, indent=2)
 
@@ -490,7 +519,14 @@ class BaselineMethodEvaluator:
 
         for m in methods[:max_methods]:
             try:
-                y_corr, bl = baseline_correction(y, method=m, return_baseline=True, clip_negative=False)
+                method_name, method_kwargs = self._label_to_spec.get(m, (m, {}))
+                y_corr, bl = baseline_correction(
+                    y,
+                    method=method_name,
+                    return_baseline=True,
+                    clip_negative=False,
+                    **method_kwargs,
+                )
                 plt.plot(x, bl, lw=1, linestyle=":", label=f"baseline: {m}")
                 plt.plot(x, y_corr, lw=1, label=f"corrected: {m}")
                 successful_methods.append(m)
@@ -503,13 +539,16 @@ class BaselineMethodEvaluator:
         plt.xlabel("m/z"); plt.ylabel("Intensity (a.u.)"); plt.title(Path(file).name)
         plt.legend(ncol=2, frameon=False); plt.tight_layout()
         if save_to:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             save_dir = OUTPUT_DIR / Path(save_to)
             save_dir.parent.mkdir(parents=True, exist_ok=True)
             for ext in (".pdf", ".png"):
-                p = save_dir / f"preview_overlay_{timestamp}{ext}"
+                p = save_dir / f"preview_overlay{ext}"
                 plt.savefig(p, bbox_inches="tight", dpi=300)
-        plt.show()
+        backend = str(plt.get_backend()).lower()
+        if "agg" in backend:
+            plt.close()
+        else:
+            plt.show()
 
         # Print summary
         if show_errors and (successful_methods or failed_methods):

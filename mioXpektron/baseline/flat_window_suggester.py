@@ -44,7 +44,6 @@ import json
 import re
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -383,6 +382,7 @@ class ScanForFlatRegion:
     n_jobs: int = -1
     flat_params: FlatParams = field(default_factory=FlatParams)
     agg_params: AggregateParams = field(default_factory=AggregateParams)
+    auto_tune: bool = False
 
     def _expand_files(self) -> List[Path]:
         paths: List[Path] = []
@@ -417,7 +417,13 @@ class ScanForFlatRegion:
     def run(self):
         files = self._expand_files()
 
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M')
+        if self.auto_tune:
+            from ..adaptive import estimate_flat_params
+            from dataclasses import replace as _replace
+            overrides = estimate_flat_params([str(f) for f in files])
+            if overrides:
+                self.flat_params = _replace(self.flat_params, **overrides)
+
         out_dir = OUTPUT_DIR / Path(self.out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -460,7 +466,7 @@ class ScanForFlatRegion:
             schema=["file", "lo", "hi", "width", "n_pts"],
             orient="row",
         ).sort(by=["file", "lo"])
-        per_file_df.write_csv(out_dir / f"per_file_segments_{timestamp}.csv")
+        per_file_df.write_csv(out_dir / "per_file_segments.csv")
 
         x_min = float(np.nanmin(xmins)) if xmins else np.nan
         x_max = float(np.nanmax(xmaxs)) if xmaxs else np.nan
@@ -510,9 +516,9 @@ class ScanForFlatRegion:
                 ]
             )
         )
-        sug_df.write_csv(out_dir / f"flat_windows_suggestions_{timestamp}.csv")
+        sug_df.write_csv(out_dir / "flat_windows_suggestions.csv")
 
-        with open(out_dir / f"flat_windows_{timestamp}.json", "w", encoding="utf-8") as f:
+        with open(out_dir / "flat_windows.json", "w", encoding="utf-8") as f:
             json.dump([[float(lo), float(hi)] for (lo, hi) in windows], f, indent=2)
 
         plt.figure(figsize=(10, 4.2))
@@ -527,7 +533,7 @@ class ScanForFlatRegion:
         plt.title("Flat-window coverage across spectra (suggested windows shaded)")
         plt.tight_layout()
         for ext in (".pdf", ".png"):
-            plt.savefig(out_dir / f"coverage_curve_{timestamp}{ext}", dpi=300, bbox_inches="tight")
+            plt.savefig(out_dir / f"coverage_curve{ext}", dpi=300, bbox_inches="tight")
         plt.close()
 
         logger.info("Suggested flat windows (lo, hi):")

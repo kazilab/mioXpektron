@@ -60,19 +60,149 @@ def _parabolic_vertex(x: np.ndarray, y: np.ndarray) -> Optional[float]:
         return None
     return float(xv)
 
+
+def _local_peak_bounds(
+    x: np.ndarray,
+    y: np.ndarray,
+    peak_idx: int,
+    *,
+    min_fraction: float = 0.25,
+    min_points: int = 3,
+) -> tuple[int, int]:
+    """Return a contiguous local support region around the apex."""
+    if len(x) == 0:
+        return 0, -1
+
+    left = peak_idx
+    right = peak_idx
+    peak_y = float(y[peak_idx])
+    baseline = float(np.nanmin(y))
+    rel_height = max(peak_y - baseline, 0.0)
+    threshold = baseline + min_fraction * rel_height
+
+    while left > 0 and y[left - 1] >= threshold:
+        left -= 1
+    while right < len(x) - 1 and y[right + 1] >= threshold:
+        right += 1
+
+    while (right - left + 1) < min_points:
+        expanded = False
+        if left > 0:
+            left -= 1
+            expanded = True
+        if (right - left + 1) >= min_points:
+            break
+        if right < len(x) - 1:
+            right += 1
+            expanded = True
+        if not expanded:
+            break
+
+    return left, right
+
+
+def _centroid_peak_center(
+    x: np.ndarray,
+    y: np.ndarray,
+    peak_idx: int,
+    *,
+    min_points: int = 3,
+    subtract_baseline: bool = True,
+    apex_fraction: Optional[float] = 0.75,
+) -> Optional[float]:
+    """Return a local centroid center with optional baseline-aware apex support."""
+    if len(x) == 0:
+        return None
+
+    left, right = _local_peak_bounds(x, y, peak_idx, min_points=min_points)
+    x_local = np.asarray(x[left:right + 1], dtype=np.float64)
+    y_local = np.asarray(y[left:right + 1], dtype=np.float64)
+    if len(x_local) == 0 or not np.isfinite(y_local).all():
+        return None
+
+    if subtract_baseline:
+        baseline = float(np.nanmin(y))
+        support_profile = np.clip(y_local - baseline, 0.0, None)
+    else:
+        support_profile = np.clip(y_local, 0.0, None)
+
+    if not np.any(support_profile > 0):
+        return None
+
+    peak_local = int(peak_idx - left)
+    if apex_fraction is not None and 0.0 < apex_fraction < 1.0:
+        threshold = float(np.nanmax(support_profile)) * apex_fraction
+        apex_left = peak_local
+        apex_right = peak_local
+        while apex_left > 0 and support_profile[apex_left - 1] >= threshold:
+            apex_left -= 1
+        while apex_right < len(support_profile) - 1 and support_profile[apex_right + 1] >= threshold:
+            apex_right += 1
+
+        while (apex_right - apex_left + 1) < min_points:
+            expanded = False
+            if apex_left > 0:
+                apex_left -= 1
+                expanded = True
+            if (apex_right - apex_left + 1) >= min_points:
+                break
+            if apex_right < len(support_profile) - 1:
+                apex_right += 1
+                expanded = True
+            if not expanded:
+                break
+
+        x_local = x_local[apex_left:apex_right+1]
+
+    weights = np.clip(y_local, 0.0, None)
+    if apex_fraction is not None and 0.0 < apex_fraction < 1.0:
+        weights = weights[apex_left:apex_right+1]
+
+    if not np.any(weights > 0):
+        return None
+    weight_sum = float(np.sum(weights))
+    if weight_sum <= 0.0:
+        return None
+    return float(np.sum(x_local * weights) / weight_sum)
+
+
+def _interpolate_channel_for_mz(
+    mz_values: np.ndarray,
+    channel_values: np.ndarray,
+    refined_mz: float,
+) -> Optional[float]:
+    """Map a refined m/z center back to a floating-point channel position."""
+    if not np.isfinite(refined_mz):
+        return None
+
+    order = np.argsort(mz_values)
+    mz_sorted = np.asarray(mz_values, dtype=np.float64)[order]
+    ch_sorted = np.asarray(channel_values, dtype=np.float64)[order]
+
+    unique_mz, unique_idx = np.unique(mz_sorted, return_index=True)
+    if len(unique_mz) < 2:
+        return None
+
+    unique_ch = ch_sorted[unique_idx]
+    if refined_mz < unique_mz[0] or refined_mz > unique_mz[-1]:
+        return None
+
+    return float(np.interp(refined_mz, unique_mz, unique_ch))
+
 def pick_peaks(
     df: pd.DataFrame,
     targets: Sequence[float] = TARGET_MASSES,
     tol_da: Optional[float] = TOL_DA_DEFAULT,
     tol_ppm: Optional[float] = TOL_PPM_DEFAULT,
-    method: str = "centroid",          # "max" | "centroid" | "parabolic"
+    method: str = "centroid",          # "max" | "centroid" | "centroid_raw" | "parabolic"
     min_points: int = 3,
     min_intensity: float = 0.0
 ) -> List[Dict]:
     """
     Select a representative (m/z, intensity, channel) near each target.
     - 'max':      highest point within window
-    - 'centroid': intensity-weighted mean m/z within window
+    - 'centroid': baseline-subtracted, apex-focused centroid within the local peak
+    - 'centroid_raw': raw intensity-weighted centroid over the local peak support
     - 'parabolic': pick apex by 'max', then refine m/z by a local quadratic fit
                    using apex±1 bins (falls back to 'max' if not feasible)
     """
@@ -119,17 +249,45 @@ def pick_peaks(
             method_used = "max"
 
         elif method == "centroid":
-            # Intensity-weighted mean m/z
-            wsum = Iw.sum()
-            if wsum > 0 and len(mzw) >= 1:
-                mz_c = float((mzw * Iw).sum() / wsum)
-                # Use channel of the closest bin; intensity as apex
-                nearest = int(np.argmin(np.abs(mz[idxs] - mz_c)))
-                k_global = int(idxs[nearest])
-                mz_pick, I_pick, ch_pick = mz_c, float(I[k_global]), int(ch[k_global])
-                method_used = "centroid"
+            mz_c = _centroid_peak_center(
+                mzw,
+                Iw,
+                k_local,
+                min_points=3,
+                subtract_baseline=True,
+                apex_fraction=0.75,
+            )
+            if mz_c is not None:
+                ch_interp = _interpolate_channel_for_mz(mzw, ch[idxs], mz_c)
+                if ch_interp is not None:
+                    mz_pick, I_pick, ch_pick = mz_c, float(I[k_global]), float(ch_interp)
+                    method_used = "centroid"
+                else:
+                    mz_pick, I_pick, ch_pick = mz[k_global], I[k_global], float(ch[k_global])
+                    method_used = "max_fallback"
             else:
-                mz_pick, I_pick, ch_pick = mz[k_global], I[k_global], int(ch[k_global])
+                mz_pick, I_pick, ch_pick = mz[k_global], I[k_global], float(ch[k_global])
+                method_used = "max_fallback"
+
+        elif method == "centroid_raw":
+            mz_c = _centroid_peak_center(
+                mzw,
+                Iw,
+                k_local,
+                min_points=3,
+                subtract_baseline=False,
+                apex_fraction=None,
+            )
+            if mz_c is not None:
+                ch_interp = _interpolate_channel_for_mz(mzw, ch[idxs], mz_c)
+                if ch_interp is not None:
+                    mz_pick, I_pick, ch_pick = mz_c, float(I[k_global]), float(ch_interp)
+                    method_used = "centroid_raw"
+                else:
+                    mz_pick, I_pick, ch_pick = mz[k_global], I[k_global], float(ch[k_global])
+                    method_used = "max_fallback"
+            else:
+                mz_pick, I_pick, ch_pick = mz[k_global], I[k_global], float(ch[k_global])
                 method_used = "max_fallback"
 
         elif method == "parabolic":
@@ -139,16 +297,18 @@ def pick_peaks(
                 trip_y = Iw[k_local-1:k_local+2]
                 xv = _parabolic_vertex(trip_x, trip_y)
                 if xv is not None and np.isfinite(xv):
-                    # pick nearest channel for reporting
-                    nearest = int(np.argmin(np.abs(mz[idxs] - xv)))
-                    k_global = int(idxs[nearest])
-                    mz_pick, I_pick, ch_pick = float(xv), float(I[k_global]), int(ch[k_global])
-                    method_used = "parabolic"
+                    ch_interp = _interpolate_channel_for_mz(mzw, ch[idxs], xv)
+                    if ch_interp is not None:
+                        mz_pick, I_pick, ch_pick = float(xv), float(I[k_global]), float(ch_interp)
+                        method_used = "parabolic"
+                    else:
+                        mz_pick, I_pick, ch_pick = mz[k_global], I[k_global], float(ch[k_global])
+                        method_used = "max_fallback"
                 else:
-                    mz_pick, I_pick, ch_pick = mz[k_global], I[k_global], int(ch[k_global])
+                    mz_pick, I_pick, ch_pick = mz[k_global], I[k_global], float(ch[k_global])
                     method_used = "max_fallback"
             else:
-                mz_pick, I_pick, ch_pick = mz[k_global], I[k_global], int(ch[k_global])
+                mz_pick, I_pick, ch_pick = mz[k_global], I[k_global], float(ch[k_global])
                 method_used = "max_fallback"
         else:
             raise ValueError(f"Unknown method: {method}")
@@ -157,7 +317,7 @@ def pick_peaks(
         out.append({
             "Target_m/z": float(xi),
             "Matched_m/z": float(mz_pick),
-            "Channel": int(ch_pick),
+            "Channel": float(ch_pick),
             "Intensity": float(I_pick),
             "n_points": int(mask.sum()),
             "edge": bool(edge),

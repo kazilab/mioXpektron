@@ -68,7 +68,7 @@ python test_column_aliases.py
 To add support for new column name variations:
 
 1. Open [`baseline_base.py`](baseline_base.py)
-2. Find the `COL_ALIASES` dictionary (around line 198)
+2. Find the `COL_ALIASES` dictionary near the I/O utility section
 3. Add your new alias to the appropriate set (all lowercase)
 4. Example: To add "tof" as an alias for channel:
    ```python

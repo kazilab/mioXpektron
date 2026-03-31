@@ -261,10 +261,9 @@ def _anscombe_forward(y: np.ndarray) -> np.ndarray:
     """
     Classical Anscombe VST for Poisson counts:
         z = 2 * sqrt(y + 3/8)
-    Requires y >= 0; negative values are clipped to 0.
+    Requires y >= 0.
     """
     y = np.asarray(y, dtype=np.float64)
-    y = np.maximum(y, 0.0)
     return 2.0 * np.sqrt(y + 3.0 / 8.0)
 
 
@@ -272,7 +271,8 @@ def _anscombe_inverse_unbiased(z: np.ndarray) -> np.ndarray:
     """
     Unbiased inverse of the classical Anscombe transform (Mäkitalo & Foi).
     Accurate for small counts; asymptotic series with safeguards.
-    Reference: Mäkitalo & Foi, IEEE TIP 2013.
+    This is the consistent inverse for the classical Anscombe forward transform
+    under a pure Poisson noise model. Reference: Mäkitalo & Foi, IEEE TIP 2013.
     """
     z = np.asarray(z, dtype=np.float64)
     # Prevent division by zero in series
@@ -288,6 +288,40 @@ def _anscombe_inverse_unbiased(z: np.ndarray) -> np.ndarray:
     return np.maximum(inv, 0.0)
 
 
+def _prepare_anscombe_input(
+    y: np.ndarray,
+    *,
+    negative_policy: Literal["warn_clip", "clip", "raise"] = "warn_clip",
+) -> np.ndarray:
+    """Validate non-negative input for the classical Anscombe transform."""
+    y = np.asarray(y, dtype=np.float64)
+    neg_mask = np.isfinite(y) & (y < 0.0)
+    if not np.any(neg_mask):
+        return y
+
+    n_neg = int(np.count_nonzero(neg_mask))
+    min_neg = float(np.min(y[neg_mask]))
+    message = (
+        "Classical Anscombe VST assumes non-negative Poisson-like input, "
+        f"but found {n_neg} negative values (min={min_neg:.6g})."
+    )
+
+    if negative_policy == "raise":
+        raise ValueError(message + " Use variance_stabilize='none' or preprocess the signal before denoising.")
+    if negative_policy not in {"warn_clip", "clip"}:
+        raise ValueError("anscombe_negative_policy must be 'warn_clip', 'clip', or 'raise'")
+    if negative_policy == "warn_clip":
+        warnings.warn(
+            message + " Clipping negatives to zero before the classical Anscombe transform.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
+    y = y.copy()
+    y[neg_mask] = 0.0
+    return y
+
+
 # =========================== wavelet denoising ============================ #
 
 def wavelet_denoise(
@@ -300,6 +334,7 @@ def wavelet_denoise(
     sigma: Optional[float] = None,
     sigma_strategy: Literal["per_level", "global"] = "per_level",
     variance_stabilize: Literal["none", "anscombe"] = "none",
+    anscombe_negative_policy: Literal["warn_clip", "clip", "raise"] = "warn_clip",
     cycle_spins: Literal[0, 4, 8, 16, 32] = 0,
     pywt_mode: str = "periodization",
     clip_nonnegative: bool = True,
@@ -332,7 +367,14 @@ def wavelet_denoise(
           • "per_level": σ_j via MAD on each detail subband (robust; recommended)
           • "global": a single σ via MAD on the finest detail of the unshifted input
     variance_stabilize : {"none","anscombe"}
-        Apply a variance-stabilizing transform prior to denoising (Anscombe for Poisson-like noise).
+        Apply a variance-stabilizing transform prior to denoising. ``"anscombe"``
+        uses the classical Anscombe forward transform with the Mäkitalo-Foi
+        unbiased inverse, appropriate for non-negative Poisson-like input.
+    anscombe_negative_policy : {"warn_clip","clip","raise"}
+        How to handle negative values before the classical Anscombe transform.
+        ``"warn_clip"`` preserves backward compatibility but emits a warning;
+        ``"raise"`` is recommended when negative values are scientifically
+        meaningful residuals rather than impossible counts.
     cycle_spins : {0,4,8,16,32}
         Number of circular shifts to average (0 disables; try 8–16 for higher SNR if compute allows).
         If cycle_spins ≥ N on very long vectors, the implementation caps the number of shifts at 2048 for performance.
@@ -361,6 +403,8 @@ def wavelet_denoise(
     y0 = np.asarray(intensities, dtype=np.float64)
     if y0.ndim != 1:
         raise ValueError("'intensities' must be a 1D array")
+    if anscombe_negative_policy not in {"warn_clip", "clip", "raise"}:
+        raise ValueError("anscombe_negative_policy must be 'warn_clip', 'clip', or 'raise'")
     
     # Precompute global sigma once (unshifted signal) if requested and not provided.
     # If requested, precompute a single global σ on the *unshifted* input using
@@ -379,7 +423,9 @@ def wavelet_denoise(
         """Replace NaNs and optionally apply the forward variance transform."""
         y = np.where(np.isfinite(y), y, 0.0)
         if variance_stabilize == "anscombe":
-            return _anscombe_forward(y)
+            return _anscombe_forward(
+                _prepare_anscombe_input(y, negative_policy=anscombe_negative_policy)
+            )
         return y
 
     def _postprocess(y: np.ndarray, y_raw: np.ndarray) -> np.ndarray:
@@ -501,6 +547,7 @@ def noise_filtering(
     sigma: Optional[float] = None,
     sigma_strategy: Literal["per_level", "global"] = "per_level",
     variance_stabilize: Literal["none", "anscombe"] = "none",
+    anscombe_negative_policy: Literal["warn_clip", "clip", "raise"] = "warn_clip",
     cycle_spins: Literal[0, 4, 8, 16, 32] = 0,
     pywt_mode: str = "periodization",
     # Shared/output behavior
@@ -545,7 +592,11 @@ def noise_filtering(
         Strategy if `sigma` is None. "per_level" = σ_j via MAD on each detail subband;
         "global" = one σ via MAD on the finest detail of the unshifted input.
     variance_stabilize : {"none","anscombe"}
-        Apply variance‑stabilizing transform before denoising (Anscombe for Poisson‑like noise).
+        Apply variance‑stabilizing transform before denoising. ``"anscombe"``
+        uses the classical Anscombe transform for non-negative Poisson-like input.
+    anscombe_negative_policy : {"warn_clip","clip","raise"}
+        Handling policy for negative values before the classical Anscombe
+        transform.
     clip_nonnegative, preserve_tic
         Output behaviors.
     x : np.ndarray or None
@@ -654,6 +705,7 @@ def noise_filtering(
                 sigma=sigma,
                 sigma_strategy=sigma_strategy,
                 variance_stabilize=variance_stabilize,
+                anscombe_negative_policy=anscombe_negative_policy,
                 cycle_spins=cycle_spins,
                 pywt_mode=pywt_mode,
                 clip_nonnegative=False,   # clip after mapping back
@@ -701,6 +753,7 @@ def noise_filtering(
             sigma=sigma,
             sigma_strategy=sigma_strategy,
             variance_stabilize=variance_stabilize,
+            anscombe_negative_policy=anscombe_negative_policy,
             cycle_spins=cycle_spins,
             pywt_mode=pywt_mode,
             clip_nonnegative=True,

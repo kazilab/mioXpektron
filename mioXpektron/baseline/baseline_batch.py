@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple, Union
 
 import json
-from datetime import datetime
 
 import polars as pl
 import matplotlib.pyplot as plt
@@ -34,9 +33,8 @@ class BaselineBatchCorrector:
     n_jobs: int = -1
     save_plots: bool = False
 
-    def _timestamp_dir(self, root: Union[str, Path], prefix: str = "baseline_corrected_spectrum") -> Path:
-        ts = datetime.now().strftime("%Y%m%d_%H%M")
-        out = Path(root) / f"{prefix}_{ts}"
+    def _output_dir(self, root: Union[str, Path], folder_name: str = "baseline_corrected_spectrum") -> Path:
+        out = Path(root) / folder_name
         out.mkdir(parents=True, exist_ok=True)
         return out
 
@@ -48,7 +46,7 @@ class BaselineBatchCorrector:
             raise FileNotFoundError(f"No files match {glob_pat} in {in_dir}")
 
         out_root = Path(out_root) if out_root else in_dir
-        out_dir = self._timestamp_dir(out_root)
+        out_dir = self._output_dir(out_root)
 
         def _proc(file: Path) -> Tuple[str, Optional[str]]:
             try:

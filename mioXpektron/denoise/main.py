@@ -1,6 +1,8 @@
 """High-level orchestration helpers for denoising spectra and reviewing results."""
 
 import logging
+import os
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 
 import numpy as np
 
@@ -14,11 +16,11 @@ except ImportError:
 
 import pandas as pd
 from pathlib import Path
-from datetime import datetime
 
 from .denoise_main import noise_filtering
-from .denoise_batch import batch_denoise
+from .denoise_batch import batch_denoise, load_txt_spectrum
 from .denoise_select import (
+    aggregate_method_summaries,
     compare_denoising_methods,
     compare_methods_in_windows,
     plot_pareto_delta_snr_vs_height,
@@ -31,6 +33,139 @@ from ..plotting import PlotPeak
 
 OUTPUT_DIR = Path("output_files")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _save_summary_frame(summary, prefix: str) -> Path:
+    """Persist a pandas/polars summary with a stable filename."""
+    file_name = f"{prefix}.xlsx"
+    file_path = OUTPUT_DIR / file_name
+    if _POLARS_AVAILABLE and isinstance(summary, pl.DataFrame):
+        summary.write_excel(file_path)
+    elif hasattr(summary, "to_excel"):
+        summary.to_excel(file_path)
+    else:
+        raise TypeError("summary must support Excel export")
+    return file_path
+
+
+def _iter_with_progress(iterable, total: int, progress: bool, desc: str):
+    """Yield items, optionally wrapped with a tqdm progress bar."""
+    if not progress:
+        for item in iterable:
+            yield item
+        return
+    try:
+        from tqdm.auto import tqdm as _tqdm
+
+        for item in _tqdm(iterable, total=total, desc=desc):
+            yield item
+    except Exception:
+        for item in iterable:
+            yield item
+
+
+def _resolve_compare_across_file_workers(
+    n_files: int,
+    *,
+    file_n_jobs,
+    method_n_jobs,
+) -> tuple[int, int]:
+    """Choose file-level and method-level worker counts without oversubscription."""
+    cpu_count = os.cpu_count() or 4
+    if n_files <= 1:
+        file_workers = 1
+    elif file_n_jobs in (None, 0):
+        # Keep a few cores available for each file's inner method comparison.
+        file_workers = min(n_files, max(1, cpu_count // 4))
+    else:
+        file_workers = max(1, int(file_n_jobs))
+
+    if method_n_jobs is None:
+        if file_workers == 1:
+            method_workers = -1
+        else:
+            method_workers = max(1, cpu_count // file_workers)
+    else:
+        method_workers = int(method_n_jobs)
+
+    return file_workers, method_workers
+
+
+def _compare_one_file(
+    *,
+    path: Path,
+    windows,
+    min_mz,
+    max_mz,
+    per_window_max_peaks,
+    min_prominence,
+    search_ppm,
+    match_min_prominence_ratio,
+    match_min_prominence_abs,
+    match_min_width_pts,
+    resample_to_uniform,
+    include_derivatives,
+    method_n_jobs,
+    method_parallel_backend,
+    method_progress,
+):
+    """Evaluate denoising selection metrics for one spectrum file."""
+    rec = load_txt_spectrum(path)
+    intensity = rec.get("intensity")
+    if intensity is None or intensity.size == 0:
+        raise ValueError(f"No intensity data found in '{path}'")
+
+    mz = rec.get("mz")
+    if mz is None or mz.size == 0:
+        mz = rec.get("channel")
+
+    if windows is None:
+        sample_summary, detail = compare_denoising_methods(
+            mz,
+            intensity,
+            min_mz=min_mz,
+            max_mz=max_mz,
+            min_prominence=min_prominence,
+            search_ppm=search_ppm,
+            match_min_prominence_ratio=match_min_prominence_ratio,
+            match_min_prominence_abs=match_min_prominence_abs,
+            match_min_width_pts=match_min_width_pts,
+            resample_to_uniform=resample_to_uniform,
+            include_derivatives=include_derivatives,
+            return_format="pandas",
+            n_jobs=method_n_jobs,
+            parallel_backend=method_parallel_backend,
+            progress=method_progress,
+        )
+    else:
+        if mz is None:
+            raise ValueError("Windowed comparison requires an m/z or channel axis.")
+        sample_summary, _, detail = compare_methods_in_windows(
+            mz,
+            intensity,
+            windows=windows,
+            per_window_max_peaks=per_window_max_peaks,
+            min_prominence=min_prominence,
+            search_ppm=search_ppm,
+            match_min_prominence_ratio=match_min_prominence_ratio,
+            match_min_prominence_abs=match_min_prominence_abs,
+            match_min_width_pts=match_min_width_pts,
+            resample_to_uniform=resample_to_uniform,
+            include_derivatives=include_derivatives,
+            return_format="pandas",
+            n_jobs=method_n_jobs,
+            parallel_backend=method_parallel_backend,
+            progress=method_progress,
+        )
+
+    sample_name = path.stem
+    sample_summary = sample_summary.copy()
+    detail = detail.copy()
+    sample_summary["sample"] = sample_name
+    sample_summary["source_file"] = str(path)
+    detail["sample"] = sample_name
+    detail["source_file"] = str(path)
+    return sample_summary, detail
 
 class DenoisingMethods:
     """Evaluate and visualize denoising strategies for mass spectrometry data.
@@ -48,10 +183,22 @@ class DenoisingMethods:
         self.mz = mz_values
         self.intensity = raw_intensities
 
-    def compare(
-        self,
-        min_mz,
-        max_mz,
+    @classmethod
+    def compare_across_files(
+        cls,
+        file_paths,
+        *,
+        windows=None,
+        min_mz=None,
+        max_mz=None,
+        per_window_max_peaks=50,
+        min_prominence=None,
+        search_ppm=20.0,
+        match_min_prominence_ratio=0.1,
+        match_min_prominence_abs=0.0,
+        match_min_width_pts=0.25,
+        resample_to_uniform=True,
+        include_derivatives=False,
         return_format='pandas',
         w_match=3.0,
         w_mz=2.0,
@@ -61,6 +208,169 @@ class DenoisingMethods:
         w_spread=1.0,
         w_noise_db=2.0,
         w_delta_snr_db=1.5,
+        selection_criteria=None,
+        file_n_jobs=0,
+        file_parallel_backend="thread",
+        method_n_jobs=None,
+        method_parallel_backend="thread",
+        progress=True,
+        save_summary=True,
+    ):
+        """Rank denoising methods across a cohort of spectra files.
+
+        Each file contributes one per-method summary, and the final cohort
+        ranking aggregates those summaries with equal file weighting. This is a
+        stronger basis for selecting a default denoiser than evaluating a single
+        arbitrary spectrum.
+
+        Parallelism
+        -----------
+        This method supports two levels of parallelism:
+        - file-level via ``file_n_jobs`` / ``file_parallel_backend``
+        - method-level inside each file via ``method_n_jobs`` / ``method_parallel_backend``
+
+        When ``file_n_jobs=0`` (default), worker counts are chosen automatically
+        to avoid nested oversubscription.
+
+        Returns
+        -------
+        tuple
+            ``(ranked_summary, sample_summary_all, detail_all)`` where
+            ``sample_summary_all`` contains one aggregated row per
+            file/method pair and ``detail_all`` contains all per-peak rows.
+        """
+        if windows is not None and (min_mz is not None or max_mz is not None):
+            raise ValueError("Use either windows or min_mz/max_mz, not both.")
+
+        paths = sorted((Path(p) for p in file_paths), key=lambda p: str(p))
+        if not paths:
+            raise ValueError("file_paths must contain at least one path")
+        for path in paths:
+            if not path.exists():
+                raise FileNotFoundError(path)
+
+        file_workers, method_workers = _resolve_compare_across_file_workers(
+            len(paths),
+            file_n_jobs=file_n_jobs,
+            method_n_jobs=method_n_jobs,
+        )
+        cpu_count = os.cpu_count() or 4
+        effective_method_workers = cpu_count if method_workers < 0 else max(1, method_workers)
+        if file_workers * effective_method_workers > cpu_count:
+            logger.warning(
+                "compare_across_files is using nested parallelism "
+                "(file_n_jobs=%s, method_n_jobs=%s). If throughput is poor, "
+                "reduce one of them.",
+                file_workers,
+                method_workers,
+            )
+
+        sample_summaries = []
+        details = []
+        worker_kwargs = dict(
+            windows=windows,
+            min_mz=min_mz,
+            max_mz=max_mz,
+            per_window_max_peaks=per_window_max_peaks,
+            min_prominence=min_prominence,
+            search_ppm=search_ppm,
+            match_min_prominence_ratio=match_min_prominence_ratio,
+            match_min_prominence_abs=match_min_prominence_abs,
+            match_min_width_pts=match_min_width_pts,
+            resample_to_uniform=resample_to_uniform,
+            include_derivatives=include_derivatives,
+            method_n_jobs=method_workers,
+            method_parallel_backend=method_parallel_backend,
+            method_progress=False,
+        )
+
+        if file_workers == 1:
+            iterable = (
+                _compare_one_file(path=path, **worker_kwargs)
+                for path in paths
+            )
+            for sample_summary, detail in _iter_with_progress(
+                iterable,
+                total=len(paths),
+                progress=progress,
+                desc="Spectra",
+            ):
+                sample_summaries.append(sample_summary)
+                details.append(detail)
+        else:
+            if file_parallel_backend == "thread":
+                Executor = ThreadPoolExecutor
+            elif file_parallel_backend == "process":
+                Executor = ProcessPoolExecutor
+            else:
+                raise ValueError("file_parallel_backend must be 'thread' or 'process'")
+
+            with Executor(max_workers=file_workers) as ex:
+                futures = [
+                    ex.submit(_compare_one_file, path=path, **worker_kwargs)
+                    for path in paths
+                ]
+                for fut in _iter_with_progress(
+                    as_completed(futures),
+                    total=len(futures),
+                    progress=progress,
+                    desc="Spectra",
+                ):
+                    sample_summary, detail = fut.result()
+                    sample_summaries.append(sample_summary)
+                    details.append(detail)
+
+        sample_summary_all = pd.concat(sample_summaries, ignore_index=True)
+        detail_all = pd.concat(details, ignore_index=True)
+        cohort_summary = aggregate_method_summaries(
+            sample_summary_all,
+            unit_label="spectra",
+            return_format="pandas",
+        )
+        ranked_summary = rank_method(
+            input_format="pandas",
+            summary_df=cohort_summary,
+            per_peak_df=detail_all,
+            w_match=w_match,
+            w_mz=w_mz,
+            w_area=w_area,
+            w_height=w_height,
+            w_fwhm=w_fwhm,
+            w_spread=w_spread,
+            w_noise_db=w_noise_db,
+            w_delta_snr_db=w_delta_snr_db,
+            selection_criteria=selection_criteria,
+        )
+
+        if save_summary:
+            _save_summary_frame(ranked_summary, "denoise_cohort_summary")
+
+        if return_format == 'pandas':
+            return ranked_summary, sample_summary_all, detail_all
+        if return_format == 'polars':
+            if not _POLARS_AVAILABLE:
+                raise ImportError("polars is not installed. Install it or use return_format='pandas'.")
+            return pl.DataFrame(ranked_summary), pl.DataFrame(sample_summary_all), pl.DataFrame(detail_all)
+        raise ValueError("return_format must be 'pandas' or 'polars'")
+
+    def compare(
+        self,
+        min_mz,
+        max_mz,
+        return_format='pandas',
+        match_min_prominence_ratio=0.1,
+        match_min_prominence_abs=0.0,
+        match_min_width_pts=0.25,
+        include_derivatives=False,
+        w_match=3.0,
+        w_mz=2.0,
+        w_area=2.0,
+        w_height=1.5,
+        w_fwhm=1.0,
+        w_spread=1.0,
+        w_noise_db=2.0,
+        w_delta_snr_db=1.5,
+        selection_criteria=None,
         save_summary=True
     ):
         """Compare denoising methods across the full spectrum window.
@@ -73,8 +383,11 @@ class DenoisingMethods:
             Determines the summary dataframe type returned by the lower-level
             evaluators.
         w_match, w_mz, w_area, w_height, w_fwhm, w_spread, w_noise_db, w_delta_snr_db : float
-            Weights applied by :func:`rank_method` when condensing metrics into a
-            single score.
+            Weights applied by :func:`rank_method` when building the secondary
+            dimensionless tie-break score.
+        selection_criteria : dict | None, optional
+            Override the default peak-preservation and denoising thresholds used
+            to define scientifically acceptable methods.
         save_summary : bool, default True
             When True and the summary is a pandas object, persist an Excel copy
             in ``OUTPUT_DIR`` for later inspection.
@@ -90,6 +403,10 @@ class DenoisingMethods:
             self.intensity,
             min_mz=min_mz,
             max_mz=max_mz,
+            match_min_prominence_ratio=match_min_prominence_ratio,
+            match_min_prominence_abs=match_min_prominence_abs,
+            match_min_width_pts=match_min_width_pts,
+            include_derivatives=include_derivatives,
             return_format=return_format
         )
         summary = rank_method(
@@ -104,14 +421,10 @@ class DenoisingMethods:
             w_spread=w_spread,
             w_noise_db=w_noise_db,
             w_delta_snr_db=w_delta_snr_db,
+            selection_criteria=selection_criteria,
         )
         if save_summary:
-            file_name = f"denoise_summary_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
-            file_path = OUTPUT_DIR / file_name
-            if _POLARS_AVAILABLE and isinstance(summary, pl.DataFrame):
-                summary.write_excel(file_path)
-            elif hasattr(summary, "to_excel"):
-                summary.to_excel(file_path)
+            _save_summary_frame(summary, "denoise_summary")
         return summary
 
     def compare_in_windows(
@@ -120,7 +433,11 @@ class DenoisingMethods:
         per_window_max_peaks=50,
         min_prominence=None,
         search_ppm=20.0,
+        match_min_prominence_ratio=0.1,
+        match_min_prominence_abs=0.0,
+        match_min_width_pts=0.25,
         resample_to_uniform=True,
+        include_derivatives=False,
         return_format='pandas',
         w_match=3.0,
         w_mz=2.0,
@@ -130,6 +447,7 @@ class DenoisingMethods:
         w_spread=1.0,
         w_noise_db=2.0,
         w_delta_snr_db=1.5,
+        selection_criteria=None,
         save_summary=True
     ):
         """Compare denoising methods within pre-defined m/z windows.
@@ -144,19 +462,23 @@ class DenoisingMethods:
             Ranked summary consistent with ``return_format``.
         """
 
-        _, window_summary, window_detail = compare_methods_in_windows(
+        rollup, _, window_detail = compare_methods_in_windows(
             self.mz,
             self.intensity,
             windows=windows,
             per_window_max_peaks=per_window_max_peaks,
             min_prominence=min_prominence,
             search_ppm=search_ppm,
+            match_min_prominence_ratio=match_min_prominence_ratio,
+            match_min_prominence_abs=match_min_prominence_abs,
+            match_min_width_pts=match_min_width_pts,
             resample_to_uniform=resample_to_uniform,
+            include_derivatives=include_derivatives,
             return_format=return_format,
         )
         summary = rank_method(
             input_format=return_format,
-            summary_df=window_summary,
+            summary_df=rollup,
             per_peak_df=window_detail,
             w_match=w_match,
             w_mz=w_mz,
@@ -166,14 +488,10 @@ class DenoisingMethods:
             w_spread=w_spread,
             w_noise_db=w_noise_db,
             w_delta_snr_db=w_delta_snr_db,
+            selection_criteria=selection_criteria,
         )
         if save_summary:
-            file_name = f"denoise_summary_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
-            file_path = OUTPUT_DIR / file_name
-            if _POLARS_AVAILABLE and isinstance(summary, pl.DataFrame):
-                summary.write_excel(file_path)
-            elif hasattr(summary, "to_excel"):
-                summary.to_excel(file_path)
+            _save_summary_frame(summary, "denoise_summary")
         return summary
 
     def plot(self, summary, annotate=True, top_k=3, save_plot=True, save_pareto=True):
@@ -288,7 +606,7 @@ class DenoisingMethods:
             save_plot=save_plot
         )
     
-    def method_parameters(self, summary, rank=0, basis="pareto_then_score",
+    def method_parameters(self, summary, rank=0, basis="constrained_pareto_then_snr",
                           require_pass=True, require_finite_metrics=True,
                           save_selected=True):
         """Extract the configuration for a ranked denoising method.
@@ -299,7 +617,7 @@ class DenoisingMethods:
             Ranked output produced by the comparison helpers.
         rank : int, default 0
             Zero-based index of the desired method after Pareto filtering.
-        basis : str, default "pareto_then_score"
+        basis : str, default "constrained_pareto_then_snr"
             Strategy forwarded to :func:`select_methods` when Pareto filtering is
             available.
         require_pass : bool, default True
@@ -334,17 +652,33 @@ class DenoisingMethods:
         can_use_pareto = {"abs_height", "delta_snr_db_med"}.issubset(columns)
 
         if can_use_pareto:
-            _, _, selected_df = select_methods(
-                df,
-                basis=basis,
-                top_k=max(rank + 1, 12),
-                require_pass=require_pass,
-                require_finite_metrics=require_finite_metrics,
-            )
+            try:
+                _, _, selected_df = select_methods(
+                    df,
+                    basis=basis,
+                    top_k=max(rank + 1, 12),
+                    require_pass=require_pass,
+                    require_finite_metrics=require_finite_metrics,
+                )
+            except ValueError as exc:
+                if require_pass and "No rows left after normalization/filters" in str(exc):
+                    raise ValueError(
+                        "No denoising methods pass the current selection criteria. "
+                        "Inspect the 'passes_selection_criteria' column, relax "
+                        "'selection_criteria' in compare()/compare_in_windows()/compare_across_files(), "
+                        "or call method_parameters(..., require_pass=False) to inspect the best available "
+                        "exploratory method."
+                    ) from exc
+                raise
         else:
             selected_df = df.copy()
-            if require_pass and "passes_min_denoise" in selected_df.columns:
-                passed = selected_df[selected_df["passes_min_denoise"] == True]  # noqa: E712
+            pass_col = None
+            if "passes_selection_criteria" in selected_df.columns:
+                pass_col = "passes_selection_criteria"
+            elif "passes_min_denoise" in selected_df.columns:
+                pass_col = "passes_min_denoise"
+            if require_pass and pass_col is not None:
+                passed = selected_df[selected_df[pass_col] == True]  # noqa: E712
                 if not passed.empty:
                     selected_df = passed
             if "score" in selected_df.columns:
@@ -364,17 +698,12 @@ class DenoisingMethods:
 
         method_label = selected_df.iloc[rank]["method"]
         if save_selected:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            out_path = OUTPUT_DIR / f"Selected_methods_{timestamp}.xlsx"
-            if _POLARS_AVAILABLE and isinstance(selected_df, pl.DataFrame):
-                selected_df.write_excel(out_path)
-            else:
-                selected_df.to_excel(out_path)
+            _save_summary_frame(selected_df, "Selected_methods")
         return decode_method_label(method_label)
 
 
 class BatchDenoising:
-    """Run denoising across a batch of spectra with timestamped outputs."""
+    """Run denoising across a batch of spectra with stable outputs."""
 
     _ALLOWED_METHODS = {'wavelet', 'gaussian', 'median', 'savitzky_golay', 'none'}
 
@@ -421,11 +750,10 @@ class BatchDenoising:
         Parameters
         ----------
         output_root : str | Path | None
-            Directory where the timestamped result folder will be created. If
+            Directory where the result folder will be created. If
             omitted, defaults to :data:`OUTPUT_DIR`.
         folder_name : str, default "denoised_spectrums"
-            Base name for the result folder. A ``YYYYmmdd_HHMM`` timestamp is
-            appended automatically.
+            Name for the result folder.
         save_result : bool, default True
             Persist the executor results dataframe to ``OUTPUT_DIR``.
 
@@ -438,8 +766,7 @@ class BatchDenoising:
             output_root = OUTPUT_DIR
         
         output_root = Path(output_root)
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M')
-        output_dir = output_root / f"{folder_name}_{timestamp}"
+        output_dir = output_root / folder_name
         output_dir.mkdir(parents=True, exist_ok=True)
 
         results = batch_denoise(
@@ -462,7 +789,7 @@ class BatchDenoising:
         self.last_output_dir = output_dir
         self.last_results = results
         if save_result:
-            result_path = output_root / f"denoising_results_{timestamp}.xlsx"
+            result_path = output_root / "denoising_results.xlsx"
             if _POLARS_AVAILABLE:
                 # Convert results to dict list for Polars
                 results_dicts = [vars(r) for r in results]

@@ -6,7 +6,7 @@ peak-detection helpers that benefit from verbose diagnostics. This eliminates
 code duplication while preserving the diagnostic output needed during
 development and validation.
 
-Version: 2.1.0-debug
+Version: 0.0.1
 """
 
 import logging
@@ -16,17 +16,20 @@ import numpy as np
 import numpy.typing as npt
 import pandas as pd
 
-# Re-export everything from the production module so that existing imports
-# (``from .flexible_calibrator_debug import FlexibleCalibrator``) keep working.
+# Re-export everything from the production modules so that existing imports
+# keep working.
 from .flexible_calibrator import (  # noqa: F401 – re-exports
     FlexibleCalibConfig,
     FlexibleCalibrator,
     CalibrationMethod,
+)
+from ._models import (
     _ppm_to_da,
     _fit_gaussian_peak,
     _fit_voigt_peak,
     _parabolic_peak_center as _parabolic_peak_center_base,
     _enhanced_pick_channels as _enhanced_pick_channels_base,
+    _enhanced_bootstrap_channels,
 )
 
 logger = logging.getLogger(__name__)
@@ -108,11 +111,14 @@ def _enhanced_pick_channels(
     logger.info("[DIAGNOSTIC] Peak picking method: %s", method)
 
     for target_idx, xi in enumerate(targets):
-        tol = (
-            _ppm_to_da(xi, tol_ppm)
-            if tol_ppm is not None
-            else (tol_da if tol_da else 2.0)
-        )
+        if tol_ppm is not None:
+            tol = _ppm_to_da(xi, tol_ppm)
+        elif tol_da is not None:
+            from ._models import _ppm_to_da as _p2d
+            max_tol = _p2d(xi, 500.0)
+            tol = max(0.05, min(tol_da, max_tol))
+        else:
+            tol = _ppm_to_da(xi, 200.0)
         left, right = xi - tol, xi + tol
         mask = (mz >= left) & (mz <= right)
 
@@ -275,7 +281,6 @@ class FlexibleCalibratorDebug(FlexibleCalibrator):
         """Autodetect calibrant channels using diagnostic peak picking."""
         import os
         from tqdm import tqdm
-        from .flexible_calibrator import _enhanced_bootstrap_channels
 
         autodetected: Dict[str, list] = {}
 

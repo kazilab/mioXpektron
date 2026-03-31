@@ -1,701 +1,410 @@
 """
-Enhanced Flexible Calibration Module for High-Resolution Mass Spectrometry
+FlexibleCalibrator — single-model calibration with user-selected method.
 
-Provides manual selection of calibration methods with enhanced features:
-- Robust fitting with outlier rejection
-- Advanced peak detection methods
-- Additional calibration models
-- Quality control and validation
-- Comprehensive error reporting
+Unlike ``AutoCalibrator`` which fits all models and picks the best,
+``FlexibleCalibrator`` fits exactly *one* user-chosen model with optional
+iterative outlier rejection and quality-control thresholds.
 
-Author: Enhanced version for production use
-Version: 2.0.0
+All model fitting, inversion, and peak-detection functions live in the
+shared ``_models`` backend.
+
+Author: Data Analysis Team @KaziLab.se
+Version: 0.0.1
 """
 
+import json
 import os
 import logging
 import warnings
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple, Literal, Any, Union
-from enum import Enum
+from dataclasses import dataclass, field, replace
+from typing import Dict, List, Literal, Optional, Sequence, Tuple
 
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
-from scipy.optimize import least_squares, curve_fit, brentq
-from scipy.interpolate import UnivariateSpline
-from scipy.signal import find_peaks
-from scipy.special import voigt_profile
-from scipy.stats import median_abs_deviation
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# --- shared backend ---
+from ._models import (
+    MODEL_REGISTRY,
+    _MODEL_ALIASES,
+    _ppm_error,
+    _ppm_to_da,
+    _fit_gaussian_peak,
+    _fit_voigt_peak,
+    _parabolic_peak_center,
+    _enhanced_pick_channels,
+    _enhanced_bootstrap_channels,
+    _fit_quad_sqrt_robust,
+    _fit_reflectron,
+    _fit_multisegment,
+    _fit_spline_model,
+    _fit_physical_tof,
+    _fit_linear_sqrt,
+    _fit_poly2,
+    _invert_quad_sqrt,
+    _invert_reflectron,
+    _invert_linear_sqrt,
+    _invert_poly2,
+    _invert_spline,
+    _invert_physical,
+    apply_model_to_spectrum,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+)
 logger = logging.getLogger(__name__)
 
-# Suppress warnings in parallel processing
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 # Type alias for calibration methods
-CalibrationMethod = Literal["quad_sqrt", "linear_sqrt", "poly2", "reflectron", "multisegment", "spline", "physical"]
+CalibrationMethod = Literal[
+    "quad_sqrt", "linear_sqrt", "poly2", "reflectron",
+    "multisegment", "spline", "physical",
+]
 
+
+def _format_segment_metrics(segment_metrics: Sequence[Dict[str, object]]) -> str:
+    """Render multisegment ppm diagnostics in a compact log-friendly format."""
+    formatted: List[str] = []
+    for metric in segment_metrics:
+        upper = "inf" if metric["mz_max"] is None else f"{metric['mz_max']:.1f}"
+        if metric.get("ppm_error") is None:
+            value = str(metric.get("status", "unavailable"))
+        else:
+            value = f"{metric['ppm_error']:.1f}ppm"
+        formatted.append(
+            f"{metric['segment']}[{metric['mz_min']:.1f},{upper})="
+            f"{value}(n={metric['n_calibrants']})"
+        )
+    return "; ".join(formatted)
+
+
+# ---------------------------------------------------------------------------
+#  Configuration
+# ---------------------------------------------------------------------------
 
 @dataclass
 class FlexibleCalibConfig:
-    """Configuration for flexible calibration with method selection.
+    """Configuration for flexible calibration with a single user-selected method."""
 
-    Formerly: FlexibleCalibConfig (for backwards compatibility)
-    """
-    
     reference_masses: List[float]
     calibration_method: CalibrationMethod = "quad_sqrt"
     output_folder: str = "calibrated_spectra"
+    output_mz_range: Optional[Tuple[Optional[float], Optional[float]]] = None
     max_workers: Optional[int] = None
-    
+
     # Peak detection parameters
-    autodetect_tol_da: Optional[float] = 2.0
+    autodetect_tol_da: Optional[float | Sequence[float]] = None
     autodetect_tol_ppm: Optional[float] = None
-    autodetect_method: str = "gaussian"  # Enhanced default
+    autodetect_method: str = "gaussian"
+    autodetect_fallback_policy: str = "max"
     autodetect_strategy: str = "mz"
     prefer_recompute_from_channel: bool = False
-    
+
     # Robust fitting parameters
     outlier_threshold: float = 3.0
     use_outlier_rejection: bool = True
     max_iterations: int = 3
-    
+
     # Quality control
     min_calibrants: int = 3
     max_ppm_threshold: Optional[float] = 100.0
     fail_on_high_error: bool = False
-    
+    retry_high_error_with_pruning: bool = False
+    retry_high_error_with_mz_fallback: bool = False
+    retry_high_error_max_removals: int = 5
+    exclude_reference_masses: List[float] = field(default_factory=list)
+    auto_screen_reference_masses: bool = False
+    screen_max_mean_abs_ppm: float = 50.0
+    screen_max_median_abs_ppm: Optional[float] = None
+    screen_min_valid_fraction: float = 0.8
+    screen_min_count: int = 3
+    screen_exclude_below_mz: float = 1.5
+
     # Advanced parameters for specific models
     spline_smoothing: Optional[float] = None
     multisegment_breakpoints: List[float] = field(default_factory=lambda: [50, 200, 500])
     instrument_params: Dict[str, float] = field(default_factory=dict)
-    
+
     # Reporting options
     save_diagnostic_plots: bool = False
     verbose: bool = True
 
+    # Adaptive parameterization (opt-in)
+    auto_tune: bool = False
 
-# ==================== Shared Helper Functions ====================
-
-def _ppm_error(true_m: npt.NDArray[np.float64], est_m: npt.NDArray[np.float64]) -> float:
-    """Calculate median absolute PPM error for robustness."""
-    mask = np.isfinite(true_m) & np.isfinite(est_m) & (true_m > 0) & (est_m > 0)
-    if not np.any(mask):
-        return np.inf
-    err_ppm = (est_m[mask] - true_m[mask]) / true_m[mask] * 1e6
-    return float(np.median(np.abs(err_ppm)))
-
-
-def _ppm_to_da(mz: float, ppm: float) -> float:
-    """Convert PPM tolerance to Dalton."""
-    return mz * (ppm * 1e-6)
-
-
-def _detect_outliers_huber(residuals: npt.NDArray[np.float64], threshold: float = 3.0) -> npt.NDArray[np.bool_]:
-    """Detect outliers using robust MAD-based method."""
-    if len(residuals) < 4:
-        return np.zeros_like(residuals, dtype=bool)
-    
-    med = np.median(residuals)
-    mad = median_abs_deviation(residuals, scale='normal')
-    
-    if mad < 1e-10:
-        return np.abs(residuals - med) > np.abs(med) * 0.1
-    
-    modified_z_scores = (residuals - med) / mad
-    return np.abs(modified_z_scores) > threshold
-
-
-def _estimate_noise_level(signal: npt.NDArray[np.float64]) -> float:
-    """Estimate noise level using robust statistics."""
-    if len(signal) < 10:
-        return np.std(signal) * 0.1
-    
-    diff_signal = np.diff(signal)
-    mad = median_abs_deviation(diff_signal, scale='normal')
-    median_diff = np.median(diff_signal)
-    
-    noise_mask = np.abs(diff_signal - median_diff) < 3 * mad
-    if noise_mask.sum() > 10:
-        return float(median_abs_deviation(diff_signal[noise_mask], scale='normal'))
-    else:
-        return float(mad)
+    def __post_init__(self):
+        if self.autodetect_fallback_policy not in {"max", "nan", "raise"}:
+            raise ValueError(
+                "autodetect_fallback_policy must be 'max', 'nan', or 'raise'"
+            )
+        if self.output_mz_range is not None:
+            if len(self.output_mz_range) != 2:
+                raise ValueError("output_mz_range must be None or a (min_mz, max_mz) pair")
+            mz_min, mz_max = self.output_mz_range
+            if (
+                mz_min is not None
+                and mz_max is not None
+                and mz_min > mz_max
+            ):
+                raise ValueError("output_mz_range must satisfy min_mz <= max_mz")
+        if self.screen_max_mean_abs_ppm <= 0:
+            raise ValueError("screen_max_mean_abs_ppm must be > 0")
+        if self.screen_max_median_abs_ppm is not None and self.screen_max_median_abs_ppm <= 0:
+            raise ValueError("screen_max_median_abs_ppm must be > 0 when provided")
+        if not 0 < self.screen_min_valid_fraction <= 1:
+            raise ValueError("screen_min_valid_fraction must be in (0, 1]")
+        if self.screen_min_count < 1:
+            raise ValueError("screen_min_count must be >= 1")
+        if self.screen_exclude_below_mz < 0:
+            raise ValueError("screen_exclude_below_mz must be >= 0")
+        if self.retry_high_error_max_removals < 1:
+            raise ValueError("retry_high_error_max_removals must be >= 1")
 
 
-# ==================== Enhanced Peak Detection ====================
+def _mask_excluded_reference_masses(
+    reference_masses: npt.NDArray[np.float64],
+    excluded_reference_masses: Sequence[float],
+    *,
+    atol: float = 1e-6,
+) -> npt.NDArray[np.bool_]:
+    """Return a mask that excludes user-specified reference masses."""
+    ref = np.asarray(reference_masses, dtype=float)
+    keep = np.ones(len(ref), dtype=bool)
+    if not excluded_reference_masses:
+        return keep
 
-def _fit_gaussian_peak(x: npt.NDArray[np.float64], y: npt.NDArray[np.float64], 
-                       x0_guess: float) -> Optional[float]:
-    """Fit Gaussian peak for accurate center determination."""
-    if len(x) < 5:
-        return None
-    
-    def gaussian(x, amp, cen, wid, offset):
-        return amp * np.exp(-(x - cen)**2 / (2 * wid**2)) + offset
-    
-    try:
-        p0 = [np.max(y), x0_guess, (np.max(x) - np.min(x)) / 4, np.min(y)]
-        bounds = ([0, np.min(x), 0, 0], 
-                 [np.inf, np.max(x), np.max(x) - np.min(x), np.max(y)])
-        
-        popt, _ = curve_fit(gaussian, x, y, p0=p0, bounds=bounds, maxfev=1000)
-        return float(popt[1])
-    except (RuntimeError, ValueError, TypeError):
-        return None
+    excluded = np.asarray(excluded_reference_masses, dtype=float)
+    for mass in excluded:
+        keep &= ~np.isclose(ref, mass, atol=atol, rtol=0.0)
+    return keep
 
 
-def _fit_voigt_peak(x: npt.NDArray[np.float64], y: npt.NDArray[np.float64], 
-                    x0_guess: float) -> Optional[float]:
-    """Fit Voigt profile for asymmetric peaks."""
-    if len(x) < 7:
-        return None
-    
-    def voigt(x, amp, cen, sigma, gamma, offset):
-        return amp * voigt_profile(x - cen, sigma, gamma) + offset
-    
-    try:
-        p0 = [np.max(y), x0_guess, 1.0, 0.5, np.min(y)]
-        bounds = ([0, np.min(x), 0.01, 0.01, 0],
-                 [np.inf, np.max(x), 10, 10, np.max(y)])
-        
-        popt, _ = curve_fit(voigt, x, y, p0=p0, bounds=bounds, maxfev=1000)
-        return float(popt[1])
-    except (RuntimeError, ValueError, TypeError):
-        return None
+def _filter_reference_masses(
+    reference_masses: Sequence[float],
+    excluded_reference_masses: Sequence[float],
+) -> npt.NDArray[np.float64]:
+    """Apply explicit reference-mass exclusions while preserving order."""
+    ref = np.asarray(reference_masses, dtype=float)
+    keep = _mask_excluded_reference_masses(ref, excluded_reference_masses)
+    return ref[keep]
 
 
-def _parabolic_peak_center(x: npt.NDArray[np.float64], y: npt.NDArray[np.float64], 
-                           peak_idx: int) -> Optional[float]:
-    """Find peak center using parabolic interpolation."""
-    if peak_idx == 0 or peak_idx == len(x) - 1:
-        return None
-    
-    x1, x2, x3 = x[peak_idx - 1], x[peak_idx], x[peak_idx + 1]
-    y1, y2, y3 = y[peak_idx - 1], y[peak_idx], y[peak_idx + 1]
-    
-    denom = (x1 - x2) * (x1 - x3) * (x2 - x3)
-    if abs(denom) < 1e-10:
-        return None
-    
-    A = (x3 * (y2 - y1) + x2 * (y1 - y3) + x1 * (y3 - y2)) / denom
-    B = (x3**2 * (y1 - y2) + x2**2 * (y3 - y1) + x1**2 * (y2 - y3)) / denom
-    
-    if abs(A) < 1e-10:
-        return None
-    
-    xc = -B / (2 * A)
-    
-    if xc < x1 or xc > x3:
-        return None
-    
-    return float(xc)
+def _filter_calibration_values(
+    calibration_values: Dict[str, Sequence[float]],
+    original_reference_masses: Sequence[float],
+    selected_reference_masses: Sequence[float],
+) -> Dict[str, npt.NDArray[np.float64]]:
+    """Subset per-file calibration values to a selected reference-mass list."""
+    original = np.asarray(original_reference_masses, dtype=float)
+    selected = np.asarray(selected_reference_masses, dtype=float)
+    keep = np.zeros(len(original), dtype=bool)
+    for mass in selected:
+        keep |= np.isclose(original, mass, atol=1e-6, rtol=0.0)
+
+    filtered: Dict[str, npt.NDArray[np.float64]] = {}
+    for file_name, values in calibration_values.items():
+        arr = np.asarray(values, dtype=float)
+        if len(arr) != len(original):
+            raise ValueError(
+                f"{file_name}: calibration values length {len(arr)} does not match "
+                f"{len(original)} reference masses"
+            )
+        filtered[file_name] = arr[keep]
+    return filtered
 
 
-def _enhanced_pick_channels(
-    df: pd.DataFrame,
-    targets: npt.NDArray[np.float64],
-    tol_da: Optional[float],
-    tol_ppm: Optional[float],
-    method: str = "gaussian",
-) -> List[int]:
-    """Enhanced peak picking with multiple methods."""
-    mz = df["m/z"].astype("float64").to_numpy()
-    I = df["Intensity"].astype("float64").to_numpy()
-    ch = df["Channel"].to_numpy()
-    
-    out: List[int] = []
-    
-    for xi in targets:
-        tol = _ppm_to_da(xi, tol_ppm) if tol_ppm is not None else (tol_da if tol_da else 2.0)
-        left, right = xi - tol, xi + tol
-        mask = (mz >= left) & (mz <= right)
-        
-        if not mask.any():
-            out.append(np.nan)
+def _filter_autodetect_methods(
+    method_map: Dict[str, List[str]],
+    original_reference_masses: Sequence[float],
+    selected_reference_masses: Sequence[float],
+) -> Dict[str, List[str]]:
+    """Subset per-file autodetect method diagnostics to selected masses."""
+    original = np.asarray(original_reference_masses, dtype=float)
+    selected = np.asarray(selected_reference_masses, dtype=float)
+    keep = np.zeros(len(original), dtype=bool)
+    for mass in selected:
+        keep |= np.isclose(original, mass, atol=1e-6, rtol=0.0)
+
+    filtered: Dict[str, List[str]] = {}
+    for file_name, methods in method_map.items():
+        if len(methods) != len(original):
+            filtered[file_name] = list(methods)
             continue
-        
-        idxs = np.flatnonzero(mask)
-        mzw = mz[idxs]
-        Iw = I[idxs]
-        chw = ch[idxs]
-        
-        k_local = int(np.nanargmax(Iw))
-        peak_mz = float(mzw[k_local])
-        
-        if method == "max":
-            final_ch = chw[k_local]
-            
-        elif method == "centroid":
-            wsum = Iw.sum()
-            if wsum > 0:
-                mz_c = float((mzw * Iw).sum() / wsum)
-                nearest = int(np.argmin(np.abs(mzw - mz_c)))
-                final_ch = chw[nearest]
-            else:
-                final_ch = chw[k_local]
-                
-        elif method == "parabolic":
-            center = _parabolic_peak_center(mzw, Iw, k_local)
-            if center is not None:
-                nearest = int(np.argmin(np.abs(mzw - center)))
-                final_ch = chw[nearest]
-            else:
-                final_ch = chw[k_local]
-                
-        elif method == "gaussian":
-            center = _fit_gaussian_peak(mzw, Iw, peak_mz)
-            if center is not None:
-                nearest = int(np.argmin(np.abs(mzw - center)))
-                final_ch = chw[nearest]
-            else:
-                # Fallback to centroid
-                wsum = Iw.sum()
-                if wsum > 0:
-                    mz_c = float((mzw * Iw).sum() / wsum)
-                    nearest = int(np.argmin(np.abs(mzw - mz_c)))
-                    final_ch = chw[nearest]
-                else:
-                    final_ch = chw[k_local]
-                    
-        elif method == "voigt":
-            center = _fit_voigt_peak(mzw, Iw, peak_mz)
-            if center is not None:
-                nearest = int(np.argmin(np.abs(mzw - center)))
-                final_ch = chw[nearest]
-            else:
-                # Fallback to gaussian
-                center = _fit_gaussian_peak(mzw, Iw, peak_mz)
-                if center is not None:
-                    nearest = int(np.argmin(np.abs(mzw - center)))
-                    final_ch = chw[nearest]
-                else:
-                    final_ch = chw[k_local]
-        else:
-            final_ch = chw[k_local]
-            
-        out.append(int(final_ch))
-        
-    return out
+        filtered[file_name] = [method for method, use in zip(methods, keep) if use]
+    return filtered
 
 
-def _enhanced_bootstrap_channels(
-    channel: npt.NDArray[np.int_],
-    intensity: npt.NDArray[np.float64],
-    ref_masses: npt.NDArray[np.float64],
-) -> List[int]:
-    """Enhanced bootstrap with adaptive thresholds."""
-    if len(intensity) < 10 or len(ref_masses) == 0:
-        return [np.nan] * len(ref_masses)
-    
-    # Estimate noise level
-    noise_level = _estimate_noise_level(intensity)
-    
-    # Adaptive peak finding
-    min_prominence = max(noise_level * 3, np.nanmax(intensity) * 0.005)
-    min_distance = max(10, len(channel) // 5000)
-    
-    peaks_idx, properties = find_peaks(
-        intensity,
-        prominence=min_prominence,
-        distance=min_distance,
-        height=noise_level * 2
-    )
-    
-    if len(peaks_idx) < 3:
-        peaks_idx, properties = find_peaks(
-            intensity,
-            prominence=min_prominence / 2,
-            distance=min_distance // 2
+def summarize_reference_mass_stability(
+    summary_df: pd.DataFrame,
+    *,
+    exclude_below_mz: float = 1.5,
+) -> pd.DataFrame:
+    """Summarize per-mass residual stability across the current calibration summary."""
+    rows: List[Dict[str, float]] = []
+    n_files = len(summary_df)
+    if n_files == 0:
+        return pd.DataFrame(
+            columns=[
+                "mass",
+                "count_valid",
+                "valid_fraction",
+                "mean_abs_ppm",
+                "median_abs_ppm",
+                "std_ppm",
+                "max_abs_ppm",
+            ]
         )
-        
-    if len(peaks_idx) < 2:
-        return [np.nan] * len(ref_masses)
-    
-    # Robust k estimation
-    peak_chs = channel[peaks_idx]
-    peak_ints = intensity[peaks_idx]
-    
-    strong_order = np.argsort(peak_ints)[::-1]
-    n_strong = min(10, len(peaks_idx))
-    strong_peaks_ch = peak_chs[strong_order[:n_strong]]
-    
-    # Vectorized pairwise k-estimation
-    # All upper-triangular peak-channel differences
-    pi, pj = np.triu_indices(len(strong_peaks_ch), k=1)
-    ch_diffs = strong_peaks_ch[pj] - strong_peaks_ch[pi]
-    valid_ch = ch_diffs > 100
-    ch_diffs = ch_diffs[valid_ch]
 
-    # All upper-triangular sqrt-mass differences
-    sqrt_masses = np.sqrt(ref_masses)
-    mi, mj = np.triu_indices(len(ref_masses), k=1)
-    sqrt_diffs = sqrt_masses[mj] - sqrt_masses[mi]
-    valid_sq = sqrt_diffs > 0.1
-    sqrt_diffs = sqrt_diffs[valid_sq]
-
-    if len(ch_diffs) > 0 and len(sqrt_diffs) > 0:
-        # Broadcast: all ch_diffs / all sqrt_diffs
-        k_all = ch_diffs[:, np.newaxis] / sqrt_diffs[np.newaxis, :]
-        k_mask = (k_all > 10) & (k_all < 10000)
-        k_estimates = k_all[k_mask].tolist()
-    else:
-        k_estimates = []
-    
-    if k_estimates:
-        k_rough = np.median(k_estimates)
-    else:
-        ch_min = np.min(strong_peaks_ch)
-        ch_max = np.max(strong_peaks_ch)
-        k_rough = (ch_max - ch_min) / (np.sqrt(ref_masses[-1]) - np.sqrt(ref_masses[0]))
-    
-    # Find peaks near expected channels
-    out = []
-    for m_ref in ref_masses:
-        expected_ch = k_rough * np.sqrt(m_ref)
-        tol_ch = max(500, expected_ch * 0.1)
-        
-        near_peaks = peaks_idx[
-            (peak_chs >= expected_ch - tol_ch) & 
-            (peak_chs <= expected_ch + tol_ch)
-        ]
-        
-        if len(near_peaks) == 0:
-            out.append(np.nan)
-        else:
-            best_idx = near_peaks[np.argmax(intensity[near_peaks])]
-            out.append(int(channel[best_idx]))
-            
-    return out
-
-
-# ==================== Calibration Models ====================
-
-def _robust_initial_params_tof(m_ref: npt.NDArray[np.float64], 
-                               t_meas: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
-    """Estimate initial TOF parameters robustly."""
-    sqrt_m = np.sqrt(m_ref)
-    
-    # Vectorized pairwise slope estimation
-    pi, pj = np.triu_indices(len(m_ref), k=1)
-    dt = t_meas[pj] - t_meas[pi]
-    dsqrt_m = sqrt_m[pj] - sqrt_m[pi]
-    valid = (np.abs(dsqrt_m) > 0.1) & (np.abs(dt) > 10)
-    k_estimates = (dt[valid] / dsqrt_m[valid]).tolist()
-    
-    k_init = np.median(k_estimates) if k_estimates else 100.0
-    t0_init = np.median(t_meas - k_init * sqrt_m)
-    c_init = 0.0
-    
-    return np.array([k_init, c_init, t0_init])
-
-
-def _fit_quad_sqrt_robust(m_ref: npt.NDArray[np.float64], 
-                   t_meas: npt.NDArray[np.float64],
-                   outlier_threshold: float = 3.0,
-                   max_iterations: int = 3) -> Optional[Tuple[float, float, float]]:
-    """Fit TOF model with iterative outlier rejection."""
-    if len(m_ref) < 3:
-        return None
-    
-    x0 = _robust_initial_params_tof(m_ref, t_meas)
-    
-    mask = np.ones(len(m_ref), dtype=bool)
-    best_params = None
-    
-    for iteration in range(max_iterations):
-        m_fit = m_ref[mask]
-        t_fit = t_meas[mask]
-        
-        if len(m_fit) < 3:
-            break
-            
-        bounds = ([0.0, -1.0, -1e4], [1e6, 1.0, 1e4])
-        
-        def resid(p):
-            k, c, t0 = p
-            return t_fit - (k * np.sqrt(m_fit) + c * m_fit + t0)
-        
-        res = least_squares(resid, x0, bounds=bounds, method='trf', loss='huber')
-        
-        if not res.success:
-            break
-            
-        best_params = res.x
-        
-        # Check for outliers
-        residuals_full = t_meas - (best_params[0] * np.sqrt(m_ref) + 
-                                   best_params[1] * m_ref + best_params[2])
-        outliers = _detect_outliers_huber(residuals_full[mask], outlier_threshold)
-        
-        if not np.any(outliers):
-            break
-            
-        temp_mask = mask.copy()
-        temp_mask[np.where(mask)[0][outliers]] = False
-        
-        if temp_mask.sum() < 3:
-            break
-            
-        mask = temp_mask
-        x0 = best_params
-        
-    if best_params is None:
-        return None
-        
-    k, c, t0 = best_params
-    return (float(k), float(c), float(t0))
-
-
-def _fit_reflectron_tof(m_ref: npt.NDArray[np.float64], 
-                       t_meas: npt.NDArray[np.float64]) -> Optional[Tuple[float, float, float, float]]:
-    """Fit extended TOF model for reflectron geometry."""
-    if len(m_ref) < 4:
-        return None
-    
-    sqrt_m = np.sqrt(m_ref)
-    quarter_m = np.power(m_ref, 0.25)
-    
-    bounds = ([0, -1e3, -1, -1e4], [1e6, 1e3, 1, 1e4])
-    lower = np.array(bounds[0], dtype=float)
-    upper = np.array(bounds[1], dtype=float)
-    eps = 1e-6
-    
-    # Estimate initial parameters with a least-squares fit and clip into bounds.
-    A = np.column_stack([sqrt_m, quarter_m, m_ref, np.ones_like(m_ref)])
-    try:
-        coeffs, *_ = np.linalg.lstsq(A, t_meas, rcond=None)
-    except np.linalg.LinAlgError:
-        coeffs = None
-    
-    if coeffs is None or not np.all(np.isfinite(coeffs)):
-        order = np.argsort(sqrt_m)
-        dsqrt = sqrt_m[order][-1] - sqrt_m[order][0]
-        if abs(dsqrt) < eps:
-            return None
-        dt = t_meas[order][-1] - t_meas[order][0]
-        k1_est = dt / dsqrt if np.isfinite(dt / dsqrt) else 0.0
-        base_t0 = np.median(t_meas - k1_est * sqrt_m)
-        coeffs = np.array(
-            [k1_est, k1_est * 0.05, 0.0, base_t0],
-            dtype=float
-        )
-    
-    x0 = np.clip(coeffs, lower + eps, upper - eps)
-    
-    def resid(p):
-        k1, k2, c, t0 = p
-        return t_meas - (k1 * sqrt_m + k2 * quarter_m + c * m_ref + t0)
-    
-    res = least_squares(resid, x0, bounds=bounds, method='trf', loss='huber')
-    
-    if not res.success:
-        return None
-        
-    k1, k2, c, t0 = res.x
-    return (float(k1), float(k2), float(c), float(t0))
-
-
-def _fit_multisegment_tof(m_ref: npt.NDArray[np.float64], 
-                          t_meas: npt.NDArray[np.float64],
-                          breakpoints: List[float]) -> Optional[Dict]:
-    """Fit piecewise TOF model for different mass ranges."""
-    segments = {}
-    all_breakpoints = [0] + sorted(breakpoints) + [np.inf]
-    
-    for i in range(len(all_breakpoints) - 1):
-        low, high = all_breakpoints[i], all_breakpoints[i + 1]
-        mask = (m_ref >= low) & (m_ref < high)
-        
-        if mask.sum() >= 3:
-            params = _fit_quad_sqrt_robust(m_ref[mask], t_meas[mask])
-            if params:
-                segments[f"segment_{i}"] = {
-                    "range": (low, high),
-                    "params": params,
-                    "n_points": mask.sum()
+    for _, row in summary_df.iterrows():
+        masses = np.asarray(row.get("calibrant_masses", []), dtype=float)
+        estimated = np.asarray(row.get("estimated_masses", []), dtype=float)
+        if len(masses) != len(estimated):
+            continue
+        for mass, est in zip(masses, estimated):
+            if not np.isfinite(mass) or mass <= exclude_below_mz:
+                continue
+            ppm_error = np.nan
+            if np.isfinite(est) and est > 0 and mass > 0:
+                ppm_error = float((est - mass) / mass * 1e6)
+            rows.append(
+                {
+                    "file_name": row.get("file_name"),
+                    "mass": float(mass),
+                    "ppm_error": ppm_error,
+                    "abs_ppm": abs(ppm_error) if np.isfinite(ppm_error) else np.nan,
                 }
-    
-    if not segments:
-        return None
-        
-    return {"segments": segments, "breakpoints": breakpoints}
+            )
+
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "mass",
+                "count_valid",
+                "valid_fraction",
+                "mean_abs_ppm",
+                "median_abs_ppm",
+                "std_ppm",
+                "max_abs_ppm",
+            ]
+        )
+
+    detail_df = pd.DataFrame(rows)
+    grouped = (
+        detail_df.groupby("mass", as_index=False)
+        .agg(
+            count_valid=("abs_ppm", lambda s: int(np.isfinite(s).sum())),
+            mean_abs_ppm=("abs_ppm", lambda s: float(np.nanmean(s)) if np.isfinite(s).any() else np.nan),
+            median_abs_ppm=("abs_ppm", lambda s: float(np.nanmedian(s)) if np.isfinite(s).any() else np.nan),
+            std_ppm=("ppm_error", lambda s: float(np.nanstd(s)) if np.isfinite(s).any() else np.nan),
+            max_abs_ppm=("abs_ppm", lambda s: float(np.nanmax(s)) if np.isfinite(s).any() else np.nan),
+        )
+        .sort_values("mass")
+    )
+    grouped["valid_fraction"] = grouped["count_valid"] / max(n_files, 1)
+    return grouped[
+        [
+            "mass",
+            "count_valid",
+            "valid_fraction",
+            "mean_abs_ppm",
+            "median_abs_ppm",
+            "std_ppm",
+            "max_abs_ppm",
+        ]
+    ]
 
 
-def _fit_spline_model(m_ref: npt.NDArray[np.float64], 
-                     t_meas: npt.NDArray[np.float64],
-                     smoothing: Optional[float] = None) -> Optional[Any]:
-    """Fit non-parametric spline model."""
-    if len(m_ref) < 4:
-        return None
-    
-    sort_idx = np.argsort(t_meas)
-    t_sorted = t_meas[sort_idx]
-    m_sorted = m_ref[sort_idx]
-    
-    sqrt_m = np.sqrt(m_sorted)
-    
-    if smoothing is None:
-        smoothing = len(m_ref) * 0.01
-    
-    try:
-        spline = UnivariateSpline(t_sorted, sqrt_m, s=smoothing, k=3)
-        
-        m_pred = spline(t_sorted)**2
-        ppm = _ppm_error(m_sorted, m_pred)
-        
-        if ppm > 1000:
-            return None
-            
-        return spline
-    except (RuntimeError, ValueError, TypeError):
-        return None
+def _absolute_ppm_errors(
+    true_masses: Sequence[float],
+    estimated_masses: Sequence[float],
+) -> npt.NDArray[np.float64]:
+    """Return per-mass absolute ppm errors, preserving NaN for invalid entries."""
+    true_arr = np.asarray(true_masses, dtype=float)
+    est_arr = np.asarray(estimated_masses, dtype=float)
+    abs_ppm = np.full_like(true_arr, np.nan, dtype=np.float64)
+    valid = np.isfinite(true_arr) & np.isfinite(est_arr) & (true_arr > 0.0) & (est_arr > 0.0)
+    if np.any(valid):
+        abs_ppm[valid] = np.abs((est_arr[valid] - true_arr[valid]) / true_arr[valid] * 1e6)
+    return abs_ppm
 
 
-def _fit_physical_tof(m_ref: npt.NDArray[np.float64], 
-                      t_meas: npt.NDArray[np.float64],
-                      instrument_params: Dict[str, float]) -> Optional[Tuple[float, float, float, float]]:
-    """Fit physical TOF model based on instrument parameters."""
-    if len(m_ref) < 4:
-        return None
-    
-    L = instrument_params.get('flight_length', 1.0)
-    V = instrument_params.get('acceleration_voltage', 20000)
-    
-    def resid(p):
-        scale, t_ext, t_det, delta = p
-        theoretical_t = scale * L * np.sqrt(m_ref / (2 * V)) + t_ext + t_det
-        return t_meas - theoretical_t
-    
-    bounds = ([0.9, -100, -10, -0.01], [1.1, 100, 10, 0.01])
-    x0 = [1.0, 0.0, 0.0, 0.0]
-    
-    res = least_squares(resid, x0, bounds=bounds, method='trf')
-    
-    if not res.success:
-        return None
-    
-    return tuple(float(x) for x in res.x)
-
-
-# Standard models (for compatibility)
-def _fit_linear_sqrt(m_ref: npt.NDArray[np.float64], 
-                    t_meas: npt.NDArray[np.float64]) -> Optional[Tuple[float, float]]:
-    """Fit linear sqrt model."""
-    if len(m_ref) < 2:
-        return None
-    
-    valid = np.isfinite(m_ref) & np.isfinite(t_meas) & (m_ref > 0) & (t_meas >= 0)
-    if valid.sum() < 2:
-        return None
-    
-    m_ref = m_ref[valid]
-    t_meas = t_meas[valid]
-    
-    y = np.sqrt(m_ref)
-    a, b = np.polyfit(t_meas, y, 1)
-    return (float(a), float(b))
-
-
-def _fit_poly2(m_ref: npt.NDArray[np.float64], 
-              t_meas: npt.NDArray[np.float64]) -> Optional[Tuple[float, float, float]]:
-    """Fit polynomial model."""
-    if len(m_ref) < 3:
-        return None
-    
-    valid = np.isfinite(m_ref) & np.isfinite(t_meas) & (m_ref > 0) & (t_meas >= 0)
-    if valid.sum() < 3:
-        return None
-    
-    m_ref = m_ref[valid]
-    t_meas = t_meas[valid]
-    
-    p2, p1, p0 = np.polyfit(t_meas, m_ref, 2)
-    return (float(p2), float(p1), float(p0))
-
-
-# Inversion functions
-def _invert_quad_sqrt(t: npt.NDArray[np.float64], k: float, c: float, t0: float) -> npt.NDArray[np.float64]:
-    """Invert TOF model."""
-    dt = np.asarray(t, dtype=np.float64) - float(t0)
-    m = np.full_like(dt, np.nan, dtype=np.float64)
-    valid = dt >= 0
-    
+def _select_worst_calibrant_index(
+    masses: Sequence[float],
+    abs_ppm: Sequence[float],
+    *,
+    exclude_below_mz: float,
+) -> Optional[int]:
+    """Pick the worst calibrant to prune, preferring masses above the exclusion floor."""
+    masses_arr = np.asarray(masses, dtype=float)
+    ppm_arr = np.asarray(abs_ppm, dtype=float)
+    valid = np.isfinite(masses_arr) & np.isfinite(ppm_arr)
     if not np.any(valid):
-        return m
-    
-    dtv = dt[valid]
-    
-    if np.isclose(c, 0.0, atol=1e-12):
-        x = dtv / float(k)
-        x = np.where(x < 0, np.nan, x)
-        m[valid] = x**2
-        return m
-    
-    disc = k * k + 4.0 * c * dtv
-    disc = np.maximum(disc, 0.0)
-    sqrtD = np.sqrt(disc)
-    x = (-k + sqrtD) / (2.0 * c)
-    x = np.where(x < 0, np.nan, x)
-    m[valid] = x**2
-    return m
+        return None
+
+    preferred_idx = np.flatnonzero(valid & (masses_arr > exclude_below_mz))
+    if preferred_idx.size > 0:
+        local = preferred_idx[np.argmax(ppm_arr[preferred_idx])]
+        return int(local)
+
+    valid_idx = np.flatnonzero(valid)
+    if valid_idx.size == 0:
+        return None
+    local = valid_idx[np.argmax(ppm_arr[valid_idx])]
+    return int(local)
 
 
-def _invert_reflectron(t: npt.NDArray[np.float64], k1: float, k2: float, 
-                       c: float, t0: float) -> npt.NDArray[np.float64]:
-    """Invert reflectron TOF model numerically."""
-    dt = t - t0
-    m_out = np.full_like(dt, np.nan)
-    
-    for i, dt_i in enumerate(dt):
-        if dt_i < 0:
+def select_stable_reference_masses(
+    reference_masses: Sequence[float],
+    stability_df: pd.DataFrame,
+    *,
+    exclude_below_mz: float = 1.5,
+    max_mean_abs_ppm: float = 50.0,
+    max_median_abs_ppm: Optional[float] = None,
+    min_valid_fraction: float = 0.8,
+    min_count: int = 3,
+) -> Tuple[npt.NDArray[np.float64], pd.DataFrame]:
+    """Select a stable reference-mass subset based on cross-spectrum residuals."""
+    ref = np.asarray(reference_masses, dtype=float)
+    annotated = stability_df.copy()
+    if annotated.empty:
+        return ref.copy(), annotated
+
+    annotated["keep_by_count"] = annotated["count_valid"] >= min_count
+    annotated["keep_by_fraction"] = annotated["valid_fraction"] >= min_valid_fraction
+    annotated["keep_by_mean"] = annotated["mean_abs_ppm"] <= max_mean_abs_ppm
+    if max_median_abs_ppm is None:
+        annotated["keep_by_median"] = True
+    else:
+        annotated["keep_by_median"] = annotated["median_abs_ppm"] <= max_median_abs_ppm
+    annotated["selected"] = (
+        annotated["keep_by_count"]
+        & annotated["keep_by_fraction"]
+        & annotated["keep_by_mean"]
+        & annotated["keep_by_median"]
+    )
+
+    keep = []
+    for mass in ref:
+        if mass <= exclude_below_mz:
+            keep.append(True)
             continue
-            
-        def equation(m):
-            if m <= 0:
-                return np.inf
-            return k1 * np.sqrt(m) + k2 * np.power(m, 0.25) + c * m - dt_i
-        
-        try:
-            m_solution = brentq(equation, 1e-6, 1e6, xtol=1e-9)
-            m_out[i] = m_solution
-        except (ValueError, RuntimeError):
-            continue
-            
-    return m_out
+        match = annotated[np.isclose(annotated["mass"], mass, atol=1e-6, rtol=0.0)]
+        if match.empty:
+            keep.append(False)
+        else:
+            keep.append(bool(match.iloc[0]["selected"]))
+
+    return ref[np.asarray(keep, dtype=bool)], annotated
 
 
-def _invert_linear_sqrt(t: npt.NDArray[np.float64], a: float, b: float) -> npt.NDArray[np.float64]:
-    """Invert linear sqrt model."""
-    x = a * t + b
-    x = np.where(x < 0, np.nan, x)
-    return x**2
-
-
-def _invert_poly2(t: npt.NDArray[np.float64], p2: float, p1: float, p0: float) -> npt.NDArray[np.float64]:
-    """Invert polynomial model."""
-    return (p2 * t + p1) * t + p0
-
-
-def _invert_spline(t: npt.NDArray[np.float64], spline: Any) -> npt.NDArray[np.float64]:
-    """Invert spline model."""
-    sqrt_m = spline(t)
-    return np.where(sqrt_m > 0, sqrt_m**2, np.nan)
-
-
-def _invert_physical(t: npt.NDArray[np.float64], scale: float, t_ext: float, 
-                     t_det: float, delta: float, L: float, V: float) -> npt.NDArray[np.float64]:
-    """Invert physical TOF model."""
-    dt = t - t_ext - t_det
-    m = 2 * V * (dt / (scale * L))**2
-    return np.where(dt > 0, m, np.nan)
-
-
-# ==================== Main Fitting Function ====================
+# ---------------------------------------------------------------------------
+#  Fit a single selected model to one file
+# ---------------------------------------------------------------------------
 
 def _fit_selected_model_enhanced(
     filename: str,
@@ -703,72 +412,97 @@ def _fit_selected_model_enhanced(
     calib_channels_dict: Dict[str, Sequence[float]],
     config: FlexibleCalibConfig,
 ) -> Optional[Tuple[str, Dict]]:
-    """Fit the user-selected calibration model with enhancements."""
+    """Fit the user-selected calibration model to *filename*."""
     if filename not in calib_channels_dict:
         logger.warning(f"{filename}: Not found in calibration channels dict")
         return None
-    
+
     t_meas = np.asarray(calib_channels_dict[filename], dtype=float)
     m_ref = np.asarray(ref_masses, dtype=float)
-    
-    # Filter out NaN channels
+
     valid = np.isfinite(t_meas)
     n_valid = valid.sum()
-    
+
     min_required = 2 if config.calibration_method == "linear_sqrt" else 3
     if n_valid < min_required:
-        logger.warning(f"{filename}: Only {n_valid} valid calibrants (need ≥{min_required})")
+        logger.warning(f"{filename}: Only {n_valid} valid calibrants (need >={min_required})")
         return None
-    
+
     t_meas = t_meas[valid]
     m_ref = m_ref[valid]
-    
+
     logger.debug(f"{filename}: Fitting {config.calibration_method} with {n_valid} calibrants")
-    
-    # Fit the selected model
+
     params = None
+    segment_metrics: List[Dict[str, object]] = []
     method = config.calibration_method
-    
+
     if method == "quad_sqrt":
         if config.use_outlier_rejection:
-            params = _fit_quad_sqrt_robust(m_ref, t_meas, 
-                                   config.outlier_threshold, 
-                                   config.max_iterations)
+            params = _fit_quad_sqrt_robust(
+                m_ref, t_meas,
+                config.outlier_threshold,
+                config.max_iterations,
+            )
         else:
-            # Simple fit without outlier rejection
             params = _fit_quad_sqrt_robust(m_ref, t_meas, max_iterations=1)
-        
+
         if params is None:
             logger.error(f"{filename}: TOF model fitting failed")
             return None
         m_est = _invert_quad_sqrt(t_meas, *params)
-        
+
     elif method == "reflectron":
-        params = _fit_reflectron_tof(m_ref, t_meas)
+        params = _fit_reflectron(m_ref, t_meas)
         if params is None:
             logger.error(f"{filename}: Reflectron model fitting failed")
             return None
         m_est = _invert_reflectron(t_meas, *params)
-        
+
     elif method == "multisegment":
-        params = _fit_multisegment_tof(m_ref, t_meas, config.multisegment_breakpoints)
+        params = _fit_multisegment(m_ref, t_meas, config.multisegment_breakpoints)
         if params is None:
             logger.error(f"{filename}: Multisegment model fitting failed")
             return None
-        # For error calculation, use simple TOF on all points
-        simple_params = _fit_quad_sqrt_robust(m_ref, t_meas)
-        if simple_params:
-            m_est = _invert_quad_sqrt(t_meas, *simple_params)
-        else:
-            m_est = m_ref  # Fallback
-            
+        # Evaluate ppm by applying each segment to its calibrants
+        m_est = np.full_like(m_ref, np.nan)
+        all_breakpoints = [0.0] + [float(bp) for bp in sorted(config.multisegment_breakpoints)] + [np.inf]
+        for i in range(len(all_breakpoints) - 1):
+            low, high = all_breakpoints[i], all_breakpoints[i + 1]
+            seg_mask = (m_ref >= low) & (m_ref < high)
+            if not seg_mask.any():
+                continue
+
+            segment_name = f"segment_{i}"
+            seg_info = params["segments"].get(segment_name)
+            metric: Dict[str, object] = {
+                "segment": segment_name,
+                "mz_min": float(low),
+                "mz_max": None if np.isinf(high) else float(high),
+                "n_calibrants": int(seg_mask.sum()),
+            }
+
+            if seg_info is not None:
+                seg_m_est = _invert_quad_sqrt(t_meas[seg_mask], *seg_info["params"])
+                m_est[seg_mask] = seg_m_est
+                metric["ppm_error"] = float(_ppm_error(m_ref[seg_mask], seg_m_est))
+                metric["status"] = "fitted"
+            elif int(seg_mask.sum()) < 3:
+                metric["ppm_error"] = None
+                metric["status"] = "insufficient_calibrants"
+            else:
+                metric["ppm_error"] = None
+                metric["status"] = "fit_failed"
+
+            segment_metrics.append(metric)
+
     elif method == "spline":
         params = _fit_spline_model(m_ref, t_meas, config.spline_smoothing)
         if params is None:
             logger.error(f"{filename}: Spline model fitting failed")
             return None
         m_est = _invert_spline(t_meas, params)
-        
+
     elif method == "physical":
         if not config.instrument_params:
             logger.error(f"{filename}: Physical model requires instrument parameters")
@@ -780,34 +514,36 @@ def _fit_selected_model_enhanced(
         L = config.instrument_params['flight_length']
         V = config.instrument_params['acceleration_voltage']
         m_est = _invert_physical(t_meas, *params, L, V)
-        
+
     elif method == "linear_sqrt":
         params = _fit_linear_sqrt(m_ref, t_meas)
         if params is None:
             logger.error(f"{filename}: Linear sqrt model fitting failed")
             return None
         m_est = _invert_linear_sqrt(t_meas, *params)
-        
+
     elif method == "poly2":
         params = _fit_poly2(m_ref, t_meas)
         if params is None:
             logger.error(f"{filename}: Poly2 model fitting failed")
             return None
         m_est = _invert_poly2(t_meas, *params)
-        
+
     else:
         logger.error(f"{filename}: Unknown calibration method '{method}'")
         return None
-    
-    # Calculate calibration error
+
     ppm = _ppm_error(m_ref, m_est)
-    
-    # Quality control
-    if config.fail_on_high_error and config.max_ppm_threshold:
+
+    if (
+        config.fail_on_high_error
+        and config.max_ppm_threshold
+        and not config.retry_high_error_with_pruning
+    ):
         if ppm > config.max_ppm_threshold:
             logger.error(f"{filename}: PPM error {ppm:.1f} exceeds threshold {config.max_ppm_threshold}")
             return None
-    
+
     result = {
         "method": method,
         "params": params,
@@ -816,178 +552,177 @@ def _fit_selected_model_enhanced(
         "calibrant_masses": m_ref.tolist(),
         "calibrant_channels": t_meas.tolist(),
         "estimated_masses": m_est.tolist(),
+        "segment_metrics": segment_metrics,
+        "rescue_initial_ppm": np.nan,
+        "rescue_n_removed": 0,
+        "rescue_removed_masses": [],
+        "rescue_strategy": "",
     }
-    
+
     logger.info(f"{filename}: {method.upper()} fitted, ppm={ppm:.1f}, n={n_valid}")
-    
+    if method == "multisegment" and segment_metrics:
+        logger.info(
+            "%s: multisegment segment ppm: %s",
+            filename,
+            _format_segment_metrics(segment_metrics),
+        )
+
     return filename, result
 
 
-def _apply_model_to_file_enhanced(args: Tuple[str, Dict[str, Dict], str, CalibrationMethod, Dict[str, float]]) -> Optional[str]:
-    """Apply the fitted calibration model with enhanced output."""
-    file_path, results_map, out_folder, method, instrument_params = args
+# ---------------------------------------------------------------------------
+#  Apply calibration to a single file
+# ---------------------------------------------------------------------------
+
+def _apply_model_to_file_enhanced(
+    args: Tuple[
+        str,
+        Dict[str, Dict],
+        str,
+        CalibrationMethod,
+        Dict[str, float],
+        Optional[Tuple[Optional[float], Optional[float]]],
+    ],
+) -> Optional[str]:
+    """Apply the fitted calibration model to a file."""
+    file_path, results_map, out_folder, method, instrument_params, output_mz_range = args
     fname = os.path.basename(file_path)
-    
+
     if fname not in results_map:
         logger.warning(f"{fname}: No calibration results found")
         return None
-    
+
     rec = results_map[fname]
     params = rec["params"]
-    
+
     try:
         df = pd.read_csv(file_path, sep="\t", header=0, comment="#")
     except Exception as e:
         logger.error(f"{fname}: Failed to read file - {e}")
         return None
-    
+
     if "Channel" not in df.columns:
         logger.error(f"{fname}: Missing 'Channel' column")
         return None
-    
+
     t = df["Channel"].astype(np.float64).to_numpy()
-    
-    # Apply the calibration model
-    if method == "quad_sqrt":
-        mz_cal = _invert_quad_sqrt(t, *params)
-    elif method == "reflectron":
-        mz_cal = _invert_reflectron(t, *params)
-    elif method == "linear_sqrt":
-        mz_cal = _invert_linear_sqrt(t, *params)
-    elif method == "poly2":
-        mz_cal = _invert_poly2(t, *params)
-    elif method == "spline":
-        mz_cal = _invert_spline(t, params)
-    elif method == "multisegment":
-        mz_cal = np.full_like(t, np.nan)
-        segments = params["segments"]
-        for seg_info in segments.values():
-            low, high = seg_info["range"]
-            seg_params = seg_info["params"]
-            mz_temp = _invert_quad_sqrt(t, *seg_params)
-            mask = (mz_temp >= low) & (mz_temp < high)
-            mz_cal[mask] = mz_temp[mask]
-    elif method == "physical":
-        L = instrument_params.get('flight_length', 1.0)
-        V = instrument_params.get('acceleration_voltage', 20000)
-        mz_cal = _invert_physical(t, *params, L, V)
-    else:
-        logger.error(f"{fname}: Unknown method '{method}'")
-        return None
-    
-    # Create output DataFrame
+
+    mz_cal = apply_model_to_spectrum(t, method, params, instrument_params)
+
     out_df = pd.DataFrame({
-        "Channel": t,      
+        "Channel": t,
         "m/z": mz_cal,
-        "Intensity": df["Intensity"].to_numpy()
+        "Intensity": df["Intensity"].to_numpy(),
     })
-    
-    # Save with metadata
+
+    if output_mz_range is not None:
+        mz_min, mz_max = output_mz_range
+        keep = np.ones(len(out_df), dtype=bool)
+        if mz_min is not None:
+            keep &= out_df["m/z"].to_numpy() >= mz_min
+        if mz_max is not None:
+            keep &= out_df["m/z"].to_numpy() <= mz_max
+        out_df = out_df.loc[keep].reset_index(drop=True)
+
     os.makedirs(out_folder, exist_ok=True)
     out_fp = os.path.join(out_folder, fname.replace(".txt", "_calibrated.txt"))
-    
+
     with open(out_fp, 'w') as f:
         f.write(f"# Calibration method: {method}\n")
         f.write(f"# Calibration error: {rec['ppm']:.1f} ppm\n")
         f.write(f"# Number of calibrants: {rec['n_calibrants']}\n")
+        if rec.get("segment_metrics"):
+            f.write(f"# Segment metrics: {json.dumps(rec['segment_metrics'])}\n")
+        if rec.get("rescue_strategy"):
+            f.write(f"# Rescue strategy: {rec['rescue_strategy']}\n")
+        if rec.get("rescue_n_removed", 0):
+            f.write(f"# Rescue initial ppm: {rec['rescue_initial_ppm']:.1f}\n")
+            f.write(f"# Rescue removed masses: {rec['rescue_removed_masses']}\n")
         f.write(f"# Calibrant masses: {rec['calibrant_masses']}\n")
+        if output_mz_range is not None:
+            f.write(f"# Saved m/z range: {list(output_mz_range)}\n")
         out_df.to_csv(f, sep="\t", index=False)
-    
+
     logger.debug(f"{fname}: Saved calibrated spectrum to {out_fp}")
-    
+
     return fname
 
 
-# ==================== Main Calibrator Class ====================
+# ---------------------------------------------------------------------------
+#  Main calibrator class
+# ---------------------------------------------------------------------------
 
 class FlexibleCalibrator:
-    """
-    Flexible Calibrator with robust fitting and advanced features.
+    """Single-model calibrator with user-selected method.
 
-    Features:
-    - User-selected calibration method
-    - Robust outlier rejection
-    - Advanced peak detection
-    - Quality control and validation
-    - Comprehensive error reporting
-    - Support for advanced models (reflectron, spline, physical)
-
-    Formerly: FlexibleCalibrator (for backwards compatibility)
+    Unlike ``AutoCalibrator``, this calibrator fits exactly one model and
+    provides more control over outlier rejection, quality thresholds, and
+    per-model parameters.
     """
 
     def __init__(self, config: Optional[FlexibleCalibConfig] = None):
-        """Initialize the flexible calibrator."""
         default_masses = [
-            1.0072764666,   # H+ 30 000
-            15.0229265168,  # CH3+ 20 000
-            22.9892207021,  # Na+ 500 000
-            27.0229265168,  # C2H3+ 200 000
-            29.0385765812,  # C2H5+ 300 000
-            38.9631579065,  # K+    6 000
-            41.0385765812,  # C3H5+ 500 000
-            43.0542266457,  # C3H7+ 300 000
-            57.0698767102,  # C4H9+ 150 000
-            58.065674,      # C₃H₈N⁺ (trimethylamine / choline-derived aminium). 300 000
-            67.0548,        # C₅H₇⁺ 200 000
-            71.0855267746,  # C5H11+ 60 000
-            86.096976,      # C5H12N+ (choline fragment; strong in tissue) 250 000
-            91.0542266457,  # C7H7+ (tropylium) 250 000
-            104.107539,     # C5H14NO+ (choline fragment; strong in tissue) 100 000
-            184.073320,     # C5H15NO4P+ (phosphocholine headgroup; hallmark of PC lipids) 70 000
-            224.105171,     # C₈H₁₉NO₄P⁺ (phosphorylcholine-related fragment) 8000
-            369.351600,     # C27H45+ (cholesterol fragment; very strong if cholesterol abundant) 12 000
+            1.0072764666,   # H+
+            15.0229265168,  # CH3+
+            22.9892207021,  # Na+
+            27.0229265168,  # C2H3+
+            29.0385765812,  # C2H5+
+            38.9631579065,  # K+
+            41.0385765812,  # C3H5+
+            43.0542266457,  # C3H7+
+            57.0698767102,  # C4H9+
+            58.065674,      # C3H8N+
+            67.0548,        # C5H7+
+            71.0855267746,  # C5H11+
+            86.096976,      # C5H12N+
+            91.0542266457,  # C7H7+ (tropylium)
+            104.107539,     # C5H14NO+
+            184.073320,     # C5H15NO4P+ (phosphocholine)
+            224.105171,     # C8H19NO4P+
+            369.351600,     # C27H45+ (cholesterol)
         ]
-        
+
         self.config = config or FlexibleCalibConfig(
             reference_masses=default_masses,
-            calibration_method="quad_sqrt"
+            calibration_method="quad_sqrt",
         )
-        
+        self.last_autodetect_methods: Dict[str, List[str]] = {}
+        self.last_reference_masses_initial: List[float] = []
+        self.last_reference_masses_used: List[float] = []
+        self.last_reference_masses_screened_out: List[float] = []
+        self.last_reference_mass_screening: pd.DataFrame = pd.DataFrame()
+        self.last_failed_or_excluded_files: pd.DataFrame = pd.DataFrame()
+
         logger.info(f"FlexibleCalibrator initialized with method={self.config.calibration_method}")
-    
-    def calibrate(
+
+    def _fit_results_map(
         self,
         files: Sequence[str],
-        calib_channels_dict: Optional[Dict[str, Sequence[float]]] = None
-    ) -> pd.DataFrame:
-        """
-        Calibrate all files using the selected calibration method.
-        
-        Returns:
-            DataFrame with calibration summary
-        """
-        os.makedirs(self.config.output_folder, exist_ok=True)
-        ref_masses = np.asarray(self.config.reference_masses, dtype=float)
+        calib_channels_dict: Dict[str, Sequence[float]],
+        ref_masses: npt.NDArray[np.float64],
+    ) -> Dict[str, Dict]:
+        """Fit the selected model for all files and return a results map."""
         method = self.config.calibration_method
-        
-        logger.info(f"Starting calibration with method={method} for {len(files)} files")
-        
-        # Autodetect if needed
-        if calib_channels_dict is None:
-            logger.info("Autodetecting calibrant channels...")
-            calib_channels_dict = self._autodetect_channels(files, ref_masses)
-        
-        # Fit model to all files
         results_map: Dict[str, Dict] = {}
         max_workers = self.config.max_workers or os.cpu_count() or 4
 
         if max_workers == 1:
-            # Single-threaded execution (avoids multiprocessing pickling issues)
             for fp in tqdm(files, desc=f"Fitting {method} model"):
                 res = _fit_selected_model_enhanced(
                     os.path.basename(fp), ref_masses,
-                    calib_channels_dict, self.config
+                    calib_channels_dict, self.config,
                 )
                 if res is not None:
                     fname, rec = res
                     results_map[fname] = rec
         else:
-            # Multi-threaded execution
             with ProcessPoolExecutor(max_workers=max_workers) as ex:
                 futs = {
-                    ex.submit(_fit_selected_model_enhanced,
-                             os.path.basename(fp), ref_masses,
-                             calib_channels_dict, self.config): fp
+                    ex.submit(
+                        _fit_selected_model_enhanced,
+                        os.path.basename(fp), ref_masses,
+                        calib_channels_dict, self.config,
+                    ): fp
                     for fp in files
                 }
 
@@ -997,28 +732,14 @@ class FlexibleCalibrator:
                     if res is not None:
                         fname, rec = res
                         results_map[fname] = rec
-        
-        if not results_map:
-            raise RuntimeError(f"No {method} models could be fitted")
-        
-        logger.info(f"Successfully fitted {len(results_map)}/{len(files)} files")
-        
-        # Check for high errors
-        if self.config.max_ppm_threshold:
-            high_error_files = [
-                fname for fname, rec in results_map.items()
-                if rec["ppm"] > self.config.max_ppm_threshold
-            ]
-            if high_error_files:
-                logger.warning(
-                    f"{len(high_error_files)} files exceed PPM threshold "
-                    f"({self.config.max_ppm_threshold:.1f})"
-                )
-        
-        # Create summary
+        return results_map
+
+    @staticmethod
+    def _build_summary(results_map: Dict[str, Dict]) -> pd.DataFrame:
+        """Convert a results map into the standard summary dataframe."""
         rows = []
         for fname, rec in results_map.items():
-            row = {
+            rows.append({
                 "file_name": fname,
                 "method": rec["method"],
                 "ppm_error": rec["ppm"],
@@ -1026,82 +747,597 @@ class FlexibleCalibrator:
                 "calibrant_masses": rec["calibrant_masses"],
                 "calibrant_channels": rec["calibrant_channels"],
                 "estimated_masses": rec["estimated_masses"],
-            }
-            rows.append(row)
-        
-        summary = pd.DataFrame(rows).sort_values("file_name")
-        summary_path = os.path.join(self.config.output_folder, 
-                                   f"calibration_summary_{method}.tsv")
-        summary.to_csv(summary_path, sep="\t", index=False)
-        
-        # Apply calibration
+                "segment_metrics": json.dumps(rec.get("segment_metrics", [])),
+                "rescue_initial_ppm": rec.get("rescue_initial_ppm", np.nan),
+                "rescue_n_removed": rec.get("rescue_n_removed", 0),
+                "rescue_removed_masses": rec.get("rescue_removed_masses", []),
+                "rescue_strategy": rec.get("rescue_strategy", ""),
+            })
+        return pd.DataFrame(rows).sort_values("file_name")
+
+    @staticmethod
+    def _build_issue_summary(
+        *,
+        missing_files: Sequence[str],
+        results_map: Dict[str, Dict],
+        excluded_high_error_files: Sequence[str],
+        threshold_ppm: Optional[float],
+    ) -> pd.DataFrame:
+        """Summarize files that failed to fit or were excluded after fitting."""
+        columns = [
+            "file_name",
+            "status",
+            "reason",
+            "ppm_error",
+            "threshold_ppm",
+            "n_calibrants",
+            "rescue_strategy",
+            "rescue_initial_ppm",
+        ]
+        rows = []
+
+        for fname in sorted(set(missing_files)):
+            rows.append({
+                "file_name": fname,
+                "status": "fit_failed",
+                "reason": "model_fit_failed_or_insufficient_calibrants",
+                "ppm_error": np.nan,
+                "threshold_ppm": threshold_ppm,
+                "n_calibrants": np.nan,
+                "rescue_strategy": "",
+                "rescue_initial_ppm": np.nan,
+            })
+
+        for fname in sorted(set(excluded_high_error_files)):
+            rec = results_map.get(fname, {})
+            ppm_error = float(rec.get("ppm", np.nan))
+            if threshold_ppm is not None and np.isfinite(ppm_error):
+                reason = f"ppm_error_above_threshold ({ppm_error:.2f} > {threshold_ppm:.2f})"
+            else:
+                reason = "ppm_error_above_threshold"
+            rows.append({
+                "file_name": fname,
+                "status": "excluded_high_ppm",
+                "reason": reason,
+                "ppm_error": ppm_error,
+                "threshold_ppm": threshold_ppm,
+                "n_calibrants": rec.get("n_calibrants", np.nan),
+                "rescue_strategy": rec.get("rescue_strategy", ""),
+                "rescue_initial_ppm": rec.get("rescue_initial_ppm", np.nan),
+            })
+
+        if not rows:
+            return pd.DataFrame(columns=columns)
+
+        issue_df = pd.DataFrame(rows, columns=columns)
+        return issue_df.sort_values(["status", "file_name"]).reset_index(drop=True)
+
+    def _fit_single_file_result(
+        self,
+        filename: str,
+        ref_masses: npt.NDArray[np.float64],
+        channels: npt.NDArray[np.float64],
+        config: FlexibleCalibConfig,
+    ) -> Optional[Dict]:
+        """Fit one file using a pre-selected subset of calibrant masses/channels."""
+        result = _fit_selected_model_enhanced(
+            filename,
+            ref_masses,
+            {filename: channels},
+            config,
+        )
+        if result is None:
+            return None
+        _fname, rec = result
+        return rec
+
+    def _fit_single_file_with_strategy(
+        self,
+        file_path: str,
+        ref_masses: npt.NDArray[np.float64],
+        *,
+        autodetect_strategy: str,
+        prefer_recompute_from_channel: bool,
+    ) -> Optional[Dict]:
+        """Autodetect and fit one file sequentially with an alternate strategy."""
+        filename = os.path.basename(file_path)
+        rescue_config = replace(
+            self.config,
+            autodetect_strategy=autodetect_strategy,
+            prefer_recompute_from_channel=prefer_recompute_from_channel,
+            max_workers=1,
+            fail_on_high_error=False,
+            retry_high_error_with_pruning=False,
+            retry_high_error_with_mz_fallback=False,
+        )
+        rescue_calibrator = FlexibleCalibrator(rescue_config)
+        channels_map = rescue_calibrator._autodetect_channels([file_path], ref_masses)
+        if filename not in channels_map:
+            return None
+
+        channels = np.asarray(channels_map[filename], dtype=float)
+        valid = np.isfinite(channels)
+        if valid.sum() < (2 if rescue_config.calibration_method == "linear_sqrt" else 3):
+            return None
+        return rescue_calibrator._fit_single_file_result(
+            filename,
+            np.asarray(ref_masses, dtype=float)[valid],
+            channels[valid],
+            rescue_config,
+        )
+
+    def _rescue_high_error_file(
+        self,
+        filename: str,
+        file_path: str,
+        ref_masses: npt.NDArray[np.float64],
+        calib_channels_dict: Dict[str, Sequence[float]],
+        initial_rec: Dict,
+    ) -> Optional[Dict]:
+        """Retry one high-error fit sequentially while pruning the worst calibrants."""
+        if filename not in calib_channels_dict:
+            return None
+
+        threshold = self.config.max_ppm_threshold
+        if threshold is None:
+            return None
+
+        channels_full = np.asarray(calib_channels_dict[filename], dtype=float)
+        masses_full = np.asarray(ref_masses, dtype=float)
+        valid = np.isfinite(channels_full) & np.isfinite(masses_full)
+        work_channels = channels_full[valid].copy()
+        work_masses = masses_full[valid].copy()
+
+        min_required = 2 if self.config.calibration_method == "linear_sqrt" else 3
+        max_removals = min(
+            self.config.retry_high_error_max_removals,
+            max(len(work_masses) - min_required, 0),
+        )
+        if max_removals <= 0:
+            return None
+
+        rescue_config = replace(
+            self.config,
+            max_workers=1,
+            fail_on_high_error=False,
+        )
+        current_rec = initial_rec
+        best_rec = initial_rec
+        removed_masses: List[float] = []
+        best_removed_masses: List[float] = []
+
+        for _ in range(max_removals):
+            abs_ppm = _absolute_ppm_errors(
+                current_rec["calibrant_masses"],
+                current_rec["estimated_masses"],
+            )
+            drop_idx = _select_worst_calibrant_index(
+                current_rec["calibrant_masses"],
+                abs_ppm,
+                exclude_below_mz=self.config.screen_exclude_below_mz,
+            )
+            if drop_idx is None or len(work_masses) <= min_required:
+                break
+
+            removed_masses.append(float(work_masses[drop_idx]))
+            work_masses = np.delete(work_masses, drop_idx)
+            work_channels = np.delete(work_channels, drop_idx)
+
+            rescued_rec = self._fit_single_file_result(
+                filename,
+                work_masses,
+                work_channels,
+                rescue_config,
+            )
+            if rescued_rec is None:
+                break
+
+            current_rec = rescued_rec
+            if np.isfinite(current_rec["ppm"]) and current_rec["ppm"] < best_rec["ppm"]:
+                best_rec = current_rec
+                best_removed_masses = list(removed_masses)
+
+            if np.isfinite(current_rec["ppm"]) and current_rec["ppm"] <= threshold:
+                break
+
+        rescue_candidate: Optional[Dict] = None
+        if np.isfinite(best_rec["ppm"]) and best_rec["ppm"] < initial_rec["ppm"]:
+            rescue_candidate = dict(best_rec)
+            rescue_candidate["rescue_initial_ppm"] = float(initial_rec["ppm"])
+            rescue_candidate["rescue_n_removed"] = len(best_removed_masses)
+            rescue_candidate["rescue_removed_masses"] = best_removed_masses
+            rescue_candidate["rescue_strategy"] = "prune_worst_calibrants"
+
+        if (
+            self.config.retry_high_error_with_mz_fallback
+            and self.config.autodetect_strategy == "bootstrap"
+            and (rescue_candidate is None or rescue_candidate["ppm"] > threshold)
+        ):
+            mz_rec = self._fit_single_file_with_strategy(
+                file_path,
+                ref_masses,
+                autodetect_strategy="mz",
+                prefer_recompute_from_channel=False,
+            )
+            if mz_rec is not None and np.isfinite(mz_rec["ppm"]):
+                baseline_ppm = initial_rec["ppm"] if rescue_candidate is None else rescue_candidate["ppm"]
+                if mz_rec["ppm"] < baseline_ppm:
+                    rescue_candidate = dict(mz_rec)
+                    rescue_candidate["rescue_initial_ppm"] = float(initial_rec["ppm"])
+                    rescue_candidate["rescue_n_removed"] = 0
+                    rescue_candidate["rescue_removed_masses"] = []
+                    rescue_candidate["rescue_strategy"] = "mz_fallback"
+
+        return rescue_candidate
+
+    def _rescue_high_error_results_map(
+        self,
+        results_map: Dict[str, Dict],
+        files: Sequence[str],
+        calib_channels_dict: Dict[str, Sequence[float]],
+        ref_masses: npt.NDArray[np.float64],
+    ) -> Dict[str, Dict]:
+        """Retry catastrophic fits sequentially before any threshold-based exclusion."""
+        threshold = self.config.max_ppm_threshold
+        if not self.config.retry_high_error_with_pruning or threshold is None:
+            return results_map
+
+        high_error_files = [
+            fname for fname, rec in results_map.items()
+            if not np.isfinite(rec["ppm"]) or rec["ppm"] > threshold
+        ]
+        if not high_error_files:
+            return results_map
+
+        logger.warning(
+            "Sequential rescue pass for %d files above %.1f ppm",
+            len(high_error_files),
+            threshold,
+        )
+
+        file_map = {os.path.basename(fp): fp for fp in files}
+        improved = 0
+        rescued_to_threshold = 0
+        for fname in high_error_files:
+            initial_ppm = float(results_map[fname]["ppm"])
+            file_path = file_map.get(fname)
+            if file_path is None:
+                continue
+            rescued_rec = self._rescue_high_error_file(
+                fname,
+                file_path,
+                ref_masses,
+                calib_channels_dict,
+                results_map[fname],
+            )
+            if rescued_rec is None:
+                continue
+
+            results_map[fname] = rescued_rec
+            improved += 1
+            if rescued_rec["ppm"] <= threshold:
+                rescued_to_threshold += 1
+            logger.warning(
+                "%s: rescue improved ppm from %.1f to %.1f using %s",
+                fname,
+                initial_ppm,
+                rescued_rec["ppm"],
+                rescued_rec.get("rescue_strategy", "rescue"),
+            )
+
+        logger.info(
+            "Rescue pass improved %d/%d high-error files; %d now pass the %.1f ppm threshold",
+            improved,
+            len(high_error_files),
+            rescued_to_threshold,
+            threshold,
+        )
+        return results_map
+
+    def _apply_results_map(
+        self,
+        files: Sequence[str],
+        results_map: Dict[str, Dict],
+    ) -> int:
+        """Apply fitted models to all files and return the number of successes."""
+        method = self.config.calibration_method
         success_count = 0
+        max_workers = self.config.max_workers or os.cpu_count() or 4
+
         if max_workers == 1:
-            # Single-threaded execution
             for fp in tqdm(files, desc=f"Applying {method} model"):
                 result = _apply_model_to_file_enhanced(
-                    (fp, results_map, self.config.output_folder, method, self.config.instrument_params)
+                    (fp, results_map, self.config.output_folder, method,
+                     self.config.instrument_params, self.config.output_mz_range),
                 )
                 if result is not None:
                     success_count += 1
         else:
-            # Multi-threaded execution
             with ProcessPoolExecutor(max_workers=max_workers) as ex:
-                args = ((fp, results_map, self.config.output_folder, method, self.config.instrument_params)
-                       for fp in files)
+                args = (
+                    (fp, results_map, self.config.output_folder, method,
+                     self.config.instrument_params, self.config.output_mz_range)
+                    for fp in files
+                )
                 for result in tqdm(ex.map(_apply_model_to_file_enhanced, args),
                                  total=len(files), desc=f"Applying {method} model"):
                     if result is not None:
                         success_count += 1
-        
+
+        return success_count
+
+    def calibrate(
+        self,
+        files: Sequence[str],
+        calib_channels_dict: Optional[Dict[str, Sequence[float]]] = None,
+    ) -> pd.DataFrame:
+        """Calibrate all files using the selected calibration method."""
+        if self.config.auto_tune:
+            from ..adaptive import auto_tune_calib_config
+            self.config = auto_tune_calib_config(
+                files, self.config.reference_masses,
+                base_config=self.config,
+            )
+            logger.info("auto_tune applied: tol_da=%s, breakpoints=%s",
+                         self.config.autodetect_tol_da,
+                         self.config.multisegment_breakpoints)
+
+        os.makedirs(self.config.output_folder, exist_ok=True)
+        original_ref_masses = np.asarray(self.config.reference_masses, dtype=float)
+        ref_masses = _filter_reference_masses(
+            original_ref_masses,
+            self.config.exclude_reference_masses,
+        )
+        method = self.config.calibration_method
+        self.last_reference_masses_initial = original_ref_masses.tolist()
+        self.last_reference_masses_used = ref_masses.tolist()
+        self.last_reference_masses_screened_out = []
+        self.last_reference_mass_screening = pd.DataFrame()
+        self.last_failed_or_excluded_files = pd.DataFrame()
+
+        logger.info(f"Starting calibration with method={method} for {len(files)} files")
+
+        if calib_channels_dict is None:
+            logger.info("Autodetecting calibrant channels...")
+            calib_channels_dict = self._autodetect_channels(files, ref_masses)
+        elif len(ref_masses) != len(original_ref_masses):
+            calib_channels_dict = _filter_calibration_values(
+                calib_channels_dict,
+                original_ref_masses,
+                ref_masses,
+            )
+
+        results_map = self._fit_results_map(files, calib_channels_dict, ref_masses)
+
+        if not results_map:
+            raise RuntimeError(f"No {method} models could be fitted")
+
+        logger.info(f"Successfully fitted {len(results_map)}/{len(files)} files")
+
+        results_map = self._rescue_high_error_results_map(
+            results_map,
+            files,
+            calib_channels_dict,
+            ref_masses,
+        )
+        summary = self._build_summary(results_map)
+
+        if self.config.auto_screen_reference_masses:
+            screening_df = summarize_reference_mass_stability(
+                summary,
+                exclude_below_mz=self.config.screen_exclude_below_mz,
+            )
+
+            if self.config.auto_tune:
+                from ..adaptive import estimate_screening_thresholds, estimate_outlier_threshold
+                adaptive_screen = estimate_screening_thresholds(screening_df)
+                if "screen_max_mean_abs_ppm" in adaptive_screen:
+                    self.config = replace(self.config,
+                                          screen_max_mean_abs_ppm=adaptive_screen["screen_max_mean_abs_ppm"])
+                if "screen_min_valid_fraction" in adaptive_screen:
+                    self.config = replace(self.config,
+                                          screen_min_valid_fraction=adaptive_screen["screen_min_valid_fraction"])
+                ppm_residuals = summary["ppm_error"].dropna().to_numpy(dtype=float)
+                if ppm_residuals.size >= 6:
+                    self.config = replace(self.config,
+                                          outlier_threshold=estimate_outlier_threshold(ppm_residuals))
+                logger.info("auto_tune screening: max_mean_abs_ppm=%.1f, min_valid_frac=%.2f, outlier_thr=%.2f",
+                            self.config.screen_max_mean_abs_ppm,
+                            self.config.screen_min_valid_fraction,
+                            self.config.outlier_threshold)
+
+            selected_ref_masses, screening_df = select_stable_reference_masses(
+                ref_masses,
+                screening_df,
+                exclude_below_mz=self.config.screen_exclude_below_mz,
+                max_mean_abs_ppm=self.config.screen_max_mean_abs_ppm,
+                max_median_abs_ppm=self.config.screen_max_median_abs_ppm,
+                min_valid_fraction=self.config.screen_min_valid_fraction,
+                min_count=self.config.screen_min_count,
+            )
+            self.last_reference_mass_screening = screening_df
+
+            selected_list = selected_ref_masses.tolist()
+            screened_out = [
+                float(mass) for mass in ref_masses
+                if not np.isclose(selected_ref_masses, mass, atol=1e-6, rtol=0.0).any()
+            ]
+            self.last_reference_masses_screened_out = screened_out
+
+            min_required = 2 if method == "linear_sqrt" else 3
+            if len(selected_ref_masses) >= min_required and len(selected_ref_masses) < len(ref_masses):
+                logger.info(
+                    "Two-pass screening kept %d/%d reference masses; screened out=%s",
+                    len(selected_ref_masses),
+                    len(ref_masses),
+                    screened_out,
+                )
+                calib_channels_dict = _filter_calibration_values(
+                    calib_channels_dict,
+                    ref_masses,
+                    selected_ref_masses,
+                )
+                self.last_autodetect_methods = _filter_autodetect_methods(
+                    self.last_autodetect_methods,
+                    ref_masses,
+                    selected_ref_masses,
+                )
+                ref_masses = selected_ref_masses
+                self.last_reference_masses_used = selected_list
+                results_map = self._fit_results_map(files, calib_channels_dict, ref_masses)
+                if not results_map:
+                    raise RuntimeError(f"No {method} models could be fitted after reference-mass screening")
+                logger.info(
+                    "Successfully refitted %d/%d files after reference-mass screening",
+                    len(results_map),
+                    len(files),
+                )
+                summary = self._build_summary(results_map)
+            else:
+                logger.info(
+                    "Reference-mass screening did not change the working set "
+                    "(selected=%d, initial=%d, minimum required=%d)",
+                    len(selected_ref_masses),
+                    len(ref_masses),
+                    min_required,
+                )
+                self.last_reference_masses_used = ref_masses.tolist()
+        else:
+            self.last_reference_masses_used = ref_masses.tolist()
+
+        fitted_files = set(results_map)
+        missing_files = [
+            os.path.basename(fp) for fp in files
+            if os.path.basename(fp) not in fitted_files
+        ]
+        excluded_high_error_files: List[str] = []
+        threshold_results_map = dict(results_map)
+
+        if self.config.max_ppm_threshold:
+            high_error_files = [
+                fname for fname, rec in results_map.items()
+                if not np.isfinite(rec["ppm"]) or rec["ppm"] > self.config.max_ppm_threshold
+            ]
+            if high_error_files:
+                logger.warning(
+                    f"{len(high_error_files)} files exceed PPM threshold "
+                    f"({self.config.max_ppm_threshold:.1f})"
+                )
+                if self.config.fail_on_high_error:
+                    excluded_high_error_files = list(high_error_files)
+                    for fname in high_error_files:
+                        results_map.pop(fname, None)
+                    if not results_map:
+                        raise RuntimeError(
+                            f"No {method} models remain after excluding high-error files"
+                        )
+                    summary = self._build_summary(results_map)
+                    logger.warning(
+                        "Excluded %d files that remained above the %.1f ppm threshold",
+                        len(high_error_files),
+                        self.config.max_ppm_threshold,
+                    )
+
+        self.last_failed_or_excluded_files = self._build_issue_summary(
+            missing_files=missing_files,
+            results_map=threshold_results_map,
+            excluded_high_error_files=excluded_high_error_files,
+            threshold_ppm=self.config.max_ppm_threshold,
+        )
+
+        summary_path = os.path.join(
+            self.config.output_folder,
+            f"calibration_summary_{method}.tsv",
+        )
+        summary.to_csv(summary_path, sep="\t", index=False)
+        if not self.last_failed_or_excluded_files.empty:
+            issues_path = os.path.join(
+                self.config.output_folder,
+                f"calibration_issues_{method}.tsv",
+            )
+            self.last_failed_or_excluded_files.to_csv(issues_path, sep="\t", index=False)
+        if self.config.auto_screen_reference_masses and not self.last_reference_mass_screening.empty:
+            screening_path = os.path.join(
+                self.config.output_folder,
+                f"reference_mass_screening_{method}.tsv",
+            )
+            self.last_reference_mass_screening.to_csv(screening_path, sep="\t", index=False)
+
+        # Apply calibration
+        apply_files = [
+            fp for fp in files
+            if os.path.basename(fp) in results_map
+        ]
+        success_count = self._apply_results_map(apply_files, results_map)
+
         logger.info(f"Calibration complete: {success_count}/{len(files)} files processed")
-        
-        # Print statistics
+
         mean_ppm = summary["ppm_error"].mean()
         median_ppm = summary["ppm_error"].median()
         logger.info(f"Mean PPM error: {mean_ppm:.1f}, Median PPM error: {median_ppm:.1f}")
-        
+
         return summary
-    
+
     def _autodetect_channels(
         self,
         files: Sequence[str],
-        ref_masses: npt.NDArray[np.float64]
+        ref_masses: npt.NDArray[np.float64],
     ) -> Dict[str, Sequence[float]]:
         """Autodetect calibrant channels with enhanced methods."""
         autodetected: Dict[str, Sequence[float]] = {}
-        
+        self.last_autodetect_methods = {}
+
         for fp in tqdm(files, desc="Autodetecting channels"):
             try:
                 df = pd.read_csv(fp, sep="\t", header=0, comment="#")
             except Exception as e:
                 logger.warning(f"{os.path.basename(fp)}: Failed to read - {e}")
                 continue
-            
+
             fname = os.path.basename(fp)
-            
+
             if "Channel" not in df.columns:
                 continue
-            
-            if self.config.prefer_recompute_from_channel or \
-               self.config.autodetect_strategy == "bootstrap" or \
-               "m/z" not in df.columns:
-                # Bootstrap from signal
+
+            if (self.config.prefer_recompute_from_channel
+                    or self.config.autodetect_strategy == "bootstrap"
+                    or "m/z" not in df.columns):
                 ch = df["Channel"].to_numpy()
                 y = df["Intensity"].astype("float64").to_numpy()
                 autodetected[fname] = _enhanced_bootstrap_channels(ch, y, ref_masses)
+                self.last_autodetect_methods[fname] = ["bootstrap"] * len(ref_masses)
             else:
-                # Use existing m/z
-                autodetected[fname] = _enhanced_pick_channels(
+                channels, methods_used = _enhanced_pick_channels(
                     df, ref_masses,
                     self.config.autodetect_tol_da,
                     self.config.autodetect_tol_ppm,
-                    self.config.autodetect_method
+                    self.config.autodetect_method,
+                    fallback_policy=self.config.autodetect_fallback_policy,
+                    return_details=True,
                 )
-        
+                autodetected[fname] = channels
+                self.last_autodetect_methods[fname] = methods_used
+
+                method_counts = pd.Series(methods_used).value_counts()
+                non_requested = method_counts.drop(
+                    labels=[self.config.autodetect_method, "none"],
+                    errors="ignore",
+                )
+                if not non_requested.empty:
+                    logger.info(
+                        "%s: autodetect requested '%s' with fallback_policy='%s'; actual methods=%s",
+                        fname,
+                        self.config.autodetect_method,
+                        self.config.autodetect_fallback_policy,
+                        ", ".join(
+                            f"{method_name} x{count}"
+                            for method_name, count in non_requested.items()
+                        ),
+                    )
+
         if not autodetected:
             raise RuntimeError("Autodetection failed")
-        
+
         logger.info(f"Autodetected channels for {len(autodetected)}/{len(files)} files")
-        
+
         return autodetected

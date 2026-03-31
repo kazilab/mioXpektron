@@ -96,8 +96,21 @@ def _process_one_file(
 
         # Vectorized: convert DataFrame to records directly
         if isinstance(peak_props, pd.DataFrame) and len(peak_props) > 0:
-            cols_to_keep = ['SampleName', 'Group', 'PeakCenter', 'PeakWidth',
-                            'PeakArea', 'Amplitude', 'DetectedBy', 'Deconvoluted']
+            cols_to_keep = [
+                'SampleName',
+                'Group',
+                'PeakCenter',
+                'PeakWidth',
+                'Prominences',
+                'PeakArea',
+                'Amplitude',
+                'DetectedBy',
+                'Deconvoluted',
+                'FitModel',
+                'AreaDefinition',
+                'WidthDefinition',
+                'IntegrationMethod',
+            ]
             existing_cols = [c for c in cols_to_keep if c in peak_props.columns]
             batch = peak_props[existing_cols].copy()
             batch['SampleName'] = batch['SampleName'].astype(str)

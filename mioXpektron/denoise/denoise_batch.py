@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_compl
 from dataclasses import dataclass
 from pathlib import Path
 import traceback, time, os
+from functools import partial
 from typing import Iterable, List, Dict, Any, Callable, Optional, Union
 from .denoise_main import noise_filtering
 
@@ -93,20 +94,32 @@ def load_txt_spectrum(path: Path) -> Dict[str, np.ndarray]:
         elif df.shape[1] == 1:
             df = df.rename({df.columns[0]: "intensity"})
 
-    # Build output dictionary with numeric arrays
-    out = {}
-    for col_name in ["channel", "mz", "intensity"]:
-        if col_name in df.columns:
-            try:
-                arr = df.select(pl.col(col_name).cast(pl.Float64, strict=False)).to_numpy().ravel()
-                arr = arr[np.isfinite(arr)]
-                if arr.size > 0:
-                    out[col_name] = arr
-            except Exception:
-                pass
+    # Build output dictionary with numeric arrays, keeping rows aligned
+    present_cols = [c for c in ["channel", "mz", "intensity"] if c in df.columns]
+    arrays = {}
+    for col_name in present_cols:
+        try:
+            arrays[col_name] = (
+                df.select(pl.col(col_name).cast(pl.Float64, strict=False))
+                .to_numpy()
+                .ravel()
+            )
+        except Exception:
+            pass
+
+    if not arrays:
+        return {"intensity": np.array([], dtype=float)}
+
+    # Build a joint finite-mask so all columns stay row-aligned
+    n = min(a.size for a in arrays.values())
+    mask = np.ones(n, dtype=bool)
+    for a in arrays.values():
+        mask &= np.isfinite(a[:n])
+
+    out = {k: v[:n][mask] for k, v in arrays.items()}
 
     # Ensure intensity is always present
-    if "intensity" not in out:
+    if "intensity" not in out or out["intensity"].size == 0:
         out["intensity"] = np.array([], dtype=float)
 
     return out
@@ -256,7 +269,7 @@ def batch_denoise(
         import os
         n_workers = os.cpu_count() or 4
 
-    worker = lambda p: _process_one(p, out_dir, method, params)
+    worker = partial(_process_one, out_dir=out_dir, method=method, params=params)
 
     results: List[BatchResult] = []
     Executor = ThreadPoolExecutor if backend == "threads" else ProcessPoolExecutor

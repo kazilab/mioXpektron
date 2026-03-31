@@ -45,7 +45,6 @@ from scipy.integrate import trapezoid
 
 from .denoise_main import noise_filtering
 from pathlib import Path
-from datetime import datetime
 
 OUTPUT_DIR = Path("output_files")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -223,6 +222,9 @@ def _eval_method_task(
     ref_meas: List["PeakMeasurement"],
     rel_height: float,
     search_ppm: float,
+    match_min_prominence_ratio: float,
+    match_min_prominence_abs: float,
+    match_min_width_pts: float,
     baseline_mask: NDArray[np.bool_],
     sigma_raw_global: float,
     local_sigma_raw: List[float],
@@ -284,7 +286,16 @@ def _eval_method_task(
 
     rows: List[Dict[str, Any]] = []
     for i, r in enumerate(ref_meas):
-        m_meas = _measure_on_method(x_arr, y_hat, r, rel_height=rel_height, search_ppm=search_ppm)
+        m_meas = _measure_on_method(
+            x_arr,
+            y_hat,
+            r,
+            rel_height=rel_height,
+            search_ppm=search_ppm,
+            min_prominence_ratio=match_min_prominence_ratio,
+            min_prominence_abs=match_min_prominence_abs,
+            min_width_pts=match_min_width_pts,
+        )
         matched = m_meas is not None
 
         # Local noise around this peak (post-denoise)
@@ -358,6 +369,9 @@ def _task_wrapper(args: Tuple[Any, ...]) -> List[Dict[str, Any]]:
         ref_meas,
         rel_height,
         search_ppm,
+        match_min_prominence_ratio,
+        match_min_prominence_abs,
+        match_min_width_pts,
         baseline_mask,
         sigma_raw_global,
         local_sigma_raw,
@@ -373,11 +387,94 @@ def _task_wrapper(args: Tuple[Any, ...]) -> List[Dict[str, Any]]:
     ) = args
     return _eval_method_task(
         name, cfg_slim, x_arr, y_arr, ref_meas, rel_height, search_ppm,
+        match_min_prominence_ratio, match_min_prominence_abs, match_min_width_pts,
         baseline_mask, sigma_raw_global, local_sigma_raw,
         hf_enabled, hf_cutoff_hz, hf_cutoff_frac, hf_resample_dx,
         hf_power_raw_global, flank_inner, flank_outer,
         hf_psd_method, hf_welch_nperseg,
     )
+
+
+def _build_denoising_method_grid(
+    x_arr: NDArray[np.float64],
+    *,
+    resample_to_uniform: bool,
+    target_dx: Optional[float],
+    include_derivatives: bool,
+) -> Dict[str, Dict[str, Any]]:
+    """Construct the candidate denoising-method grid for model selection."""
+    methods: Dict[str, Dict[str, Any]] = {}
+
+    for th in ("universal", "bayes", "sure", "sure_opt"):
+        for sigstr in ("per_level", "global"):
+            for wvlt in ("db4", "db8", "sym5", "sym8", "coif2", "coif3"):
+                for cs in (0, 4, 8, 16, 32):
+                    for vst in ("none", "anscombe"):
+                        label = f"wavelet:{th}:{sigstr}:{wvlt}:{cs}:{vst}"
+                        methods[label] = dict(
+                            method="wavelet",
+                            wavelet=wvlt,
+                            level=None,
+                            threshold_strategy=th,
+                            threshold_mode="soft",
+                            sigma=None,
+                            sigma_strategy=sigstr,
+                            variance_stabilize=vst,
+                            cycle_spins=cs,
+                            pywt_mode="periodization",
+                            clip_nonnegative=True,
+                            preserve_tic=False,
+                            x=x_arr,
+                            resample_to_uniform=resample_to_uniform,
+                            target_dx=target_dx,
+                        )
+
+    sg_derivs = (0, 1, 2) if include_derivatives else (0,)
+    for win_l in (10, 15, 20, 25, 50):
+        for poly in (2, 3, 4, 5):
+            wl = int(win_l)
+            if wl % 2 == 0:
+                wl += 1
+            if wl <= poly:
+                continue
+            for deriv in sg_derivs:
+                label = f"savitzky_golay:window_{wl}:poly_{poly}:deriv_{deriv}"
+                methods[label] = dict(
+                    method="savitzky_golay",
+                    window_length=wl,
+                    polyorder=poly,
+                    deriv=deriv,
+                    x=x_arr,
+                    resample_to_uniform=resample_to_uniform,
+                    target_dx=target_dx,
+                )
+
+    gaussian_orders = (0, 1, 2) if include_derivatives else (0,)
+    for win_lg in (10, 15, 20, 25, 50):
+        for gorder in gaussian_orders:
+            label = f"gaussian:window_{win_lg}:order_{gorder}"
+            methods[label] = dict(
+                method="gaussian",
+                window_length=win_lg,
+                gauss_sigma_pts=max(1.0, win_lg / 6.0),
+                gaussian_order=gorder,
+                x=x_arr,
+                resample_to_uniform=resample_to_uniform,
+                target_dx=target_dx,
+            )
+
+    for win_lm in (10, 15, 20, 25, 50):
+        label = f"median:window_{win_lm}"
+        methods[label] = dict(
+            method="median",
+            window_length=win_lm,
+            x=x_arr,
+            resample_to_uniform=resample_to_uniform,
+            target_dx=target_dx,
+        )
+
+    methods["none"] = dict(method="none", x=x_arr, resample_to_uniform=False, target_dx=None)
+    return methods
 
 
 @dataclass
@@ -398,6 +495,9 @@ class PeakMeasurement:
         Left/right m/z boundaries where the peak crosses the chosen relative height (e.g., 50%).
     area : float
         Trapezoidal integral of y over [mz_left, mz_right].
+    prominence : float
+        Peak prominence measured on the same signal; used to reject weak
+        shoulders when re-matching peaks after denoising.
     """
     mz_center: float
     idx_center: int
@@ -406,6 +506,7 @@ class PeakMeasurement:
     mz_left: float
     mz_right: float
     area: float
+    prominence: float = np.nan
 
 
 def _ensure_axes(y: np.ndarray,
@@ -472,7 +573,8 @@ def _measure_one_peak(
         x: NDArray[np.float64],
         y: NDArray[np.float64],
         peak_idx: int,
-        rel_height: float = 0.5
+        rel_height: float = 0.5,
+        prominence: Optional[float] = None,
 ) -> PeakMeasurement:
     """Measure a single peak at `peak_idx` on signal `y` using SciPy's half-height width.
 
@@ -513,6 +615,11 @@ def _measure_one_peak(
     xx = x[i0:i1+1]
     yy = y[i0:i1+1]
     area = float(trapezoid(yy, xx))
+    if prominence is None:
+        try:
+            prominence = float(signal.peak_prominences(y, [peak_idx])[0][0])
+        except (ValueError, RuntimeError, FloatingPointError, IndexError):
+            prominence = np.nan
 
     return PeakMeasurement(
         mz_center=mz_center,
@@ -522,6 +629,7 @@ def _measure_one_peak(
         mz_left=mz_left,
         mz_right=mz_right,
         area=area,
+        prominence=float(prominence) if prominence is not None else np.nan,
     )
 
 
@@ -547,9 +655,18 @@ def _build_reference_peaks(
     keep = order[:max_peaks]
     peaks_ref = peaks[keep]
 
+    prom_lookup = {int(pk): float(pm) for pk, pm in zip(peaks.tolist(), prom.tolist())}
     ref_measurements: List[PeakMeasurement] = []
     for p in peaks_ref:
-        ref_measurements.append(_measure_one_peak(x, y, int(p), rel_height=rel_height))
+        ref_measurements.append(
+            _measure_one_peak(
+                x,
+                y,
+                int(p),
+                rel_height=rel_height,
+                prominence=prom_lookup.get(int(p), np.nan),
+            )
+        )
     return peaks_ref, ref_measurements
 
 
@@ -559,10 +676,19 @@ def _measure_on_method(
     ref_meas: PeakMeasurement,
     rel_height: float = 0.5,
     search_ppm: float = 20.0,
+    min_prominence_ratio: float = 0.1,
+    min_prominence_abs: float = 0.0,
+    min_width_pts: float = 0.25,
 ) -> Optional[PeakMeasurement]:
     """
-    Re-measure peak near the reference center within a ppm window on y_method.
-    Returns None if no local maximum is found in the window (peak 'lost').
+    Re-measure a peak near the reference center within a ppm window on ``y_method``.
+
+    Matching is intentionally conservative:
+    - candidates must be true local maxima returned by ``find_peaks``
+    - candidates must clear a minimum prominence relative to the reference peak
+    - widths and enclosed areas must remain positive after re-measurement
+
+    Returns ``None`` if no scientifically plausible match is found.
     """
     mz0 = float(ref_meas.mz_center)
     tol = float(mz0 * search_ppm * 1e-6)
@@ -578,20 +704,61 @@ def _measure_on_method(
     m: NDArray[np.bool_] = (x >= left) & (x <= right)
     if not np.any(m):
         return None
+    idx_window = np.nonzero(m)[0]
     ys = y_method[m]
     if ys.size < 3:
         return None
 
-    # local maximum index (relative, then to absolute)
-    i_rel = int(np.argmax(ys))
-    idx_center = int(np.nonzero(m)[0][0] + i_rel)
-
-    # measure at this local maximum
-    try:
-        return _measure_one_peak(x, y_method, idx_center, rel_height=rel_height)
-    except (ValueError, RuntimeError, IndexError, FloatingPointError):
-        # peak_widths can fail if the local max is too flat/noisy or indices are invalid; mark as lost
+    # Only consider true local maxima inside the search window; this prevents a
+    # monotonic shoulder or boundary sample from being counted as a preserved peak.
+    peak_rel, props = signal.find_peaks(ys, prominence=0.0)
+    if peak_rel.size == 0:
         return None
+
+    prominences = np.asarray(props.get("prominences", np.full(peak_rel.size, np.nan)), dtype=float)
+    ref_prom = float(ref_meas.prominence) if np.isfinite(ref_meas.prominence) else np.nan
+    min_prom = float(min_prominence_abs)
+    if np.isfinite(ref_prom) and ref_prom > 0:
+        min_prom = max(min_prom, float(min_prominence_ratio) * ref_prom)
+
+    valid = np.isfinite(prominences)
+    if min_prom > 0:
+        valid &= prominences >= min_prom
+    if not np.any(valid):
+        return None
+
+    peak_rel = peak_rel[valid]
+    prominences = prominences[valid]
+    abs_idx = idx_window[peak_rel]
+    peak_mz = x[abs_idx]
+
+    # Prefer the closest peak to the reference center, then break ties by prominence.
+    order = np.lexsort((-prominences, np.abs(peak_mz - mz0)))
+    for ord_idx in order:
+        idx_center = int(abs_idx[ord_idx])
+        prominence = float(prominences[ord_idx])
+        try:
+            measured = _measure_one_peak(
+                x,
+                y_method,
+                idx_center,
+                rel_height=rel_height,
+                prominence=prominence,
+            )
+        except (ValueError, RuntimeError, IndexError, FloatingPointError):
+            continue
+
+        if not np.isfinite(measured.fwhm_pts) or measured.fwhm_pts <= float(min_width_pts):
+            continue
+        if not np.isfinite(measured.area) or measured.area <= 0:
+            continue
+        if not (np.isfinite(measured.mz_left) and np.isfinite(measured.mz_right)):
+            continue
+        if measured.mz_right <= measured.mz_left:
+            continue
+        return measured
+
+    return None
 
 
 def _percent_change(a: float, b: float) -> float:
@@ -615,7 +782,11 @@ def compare_denoising_methods(
     min_prominence: Optional[float] = None,
     rel_height: float = 0.5,
     search_ppm: float = 20.0,
+    match_min_prominence_ratio: float = 0.1,
+    match_min_prominence_abs: float = 0.0,
+    match_min_width_pts: float = 0.25,
     resample_to_uniform: bool = False,
+    include_derivatives: bool = False,
     target_dx: Optional[float] = None,
     return_format: Literal["pandas", "polars"] = "pandas",
     n_jobs: int = -1,
@@ -651,8 +822,19 @@ def compare_denoising_methods(
         Relative height used for FWHM measurements (e.g., 0.5 = half-height).
     search_ppm : float, default 20.0
         ±ppm window around each reference m/z used to re-detect peaks after denoising.
+    match_min_prominence_ratio : float, default 0.1
+        Minimum post-denoise prominence required for a matched peak, expressed
+        as a fraction of the raw reference prominence.
+    match_min_prominence_abs : float, default 0.0
+        Absolute lower bound for post-denoise peak prominence.
+    match_min_width_pts : float, default 0.25
+        Minimum acceptable peak width in index points for a post-denoise match.
     resample_to_uniform : bool, default False
         If True, allow denoisers to resample to a uniform grid internally when beneficial.
+    include_derivatives : bool, default False
+        If True, include derivative-style Savitzky-Golay (`deriv>0`) and
+        Gaussian (`order>0`) operators in the candidate grid. By default the
+        search includes only smoothing/denoising variants.
     target_dx : float, optional
         Desired spacing when `resample_to_uniform=True`.
     return_format : {"pandas","polars"}, default "pandas"
@@ -717,77 +899,12 @@ def compare_denoising_methods(
     else:
         hf_power_raw_global, hf_frac_raw_global = np.nan, np.nan
 
-    # --- Build method grid: wavelets (thresholding strategies, sigma strategies, VST, cycle-spins)
-    methods: Dict[str, Dict] = {}
-    for th in ("universal", "bayes", "sure", "sure_opt"):
-            for sigstr in ("per_level", "global"):
-                for wvlt in ("db4", "db8", "sym5", "sym8", "coif2", "coif3"):
-                    for cs in (0, 4, 8, 16, 32):
-                        for vst in ("none", "anscombe"):
-                            label = f"wavelet:{th}:{sigstr}:{wvlt}:{cs}:{vst}"
-                            methods[label] = dict(
-                                method="wavelet",
-                                wavelet=wvlt,
-                                level=None,
-                                threshold_strategy=th,
-                                threshold_mode="soft",
-                                sigma=None,
-                                sigma_strategy=sigstr,
-                                variance_stabilize=vst,
-                                cycle_spins=cs,
-                                pywt_mode="periodization",
-                                clip_nonnegative=True,
-                                preserve_tic=False,
-                                x=x_arr,
-                                resample_to_uniform=resample_to_uniform,
-                                target_dx=target_dx,
-                            )
-    # --- Savitzky–Golay grid (SciPy constraints enforced: odd window, window_length > polyorder)
-    for win_l in (10, 15, 20, 25, 50):
-        for poly in (2, 3, 4, 5):
-            # Enforce SciPy constraints: odd window and window_length > polyorder
-            wl = int(win_l)
-            if wl % 2 == 0:
-                wl += 1
-            if wl <= poly:
-                continue
-            for deriv in (0, 1, 2):
-                labels = f"savitzky_golay:window_{wl}:poly_{poly}:deriv_{deriv}"
-                methods[labels] = dict(
-                    method="savitzky_golay",
-                    window_length=wl,
-                    polyorder=poly,
-                    deriv=deriv,
-                    x=x_arr,
-                    resample_to_uniform=resample_to_uniform,
-                    target_dx=target_dx,
-                )
-    # --- Gaussian smoothing grid (derive sigma from window length; orders 0/1/2)
-    for win_lg in (10, 15, 20, 25, 50):
-        for gorder in (0, 1, 2):
-            labelg = f"gaussian:window_{win_lg}:order_{gorder}"
-            # Derive sigma from window length (rule of thumb: window ≈ 6σ)
-            _sigma = max(1.0, win_lg / 6.0)
-            methods[labelg] = dict(
-                method="gaussian",
-                window_length=win_lg,
-                gauss_sigma_pts=_sigma,
-                gaussian_order=gorder,
-                x=x_arr,
-                resample_to_uniform=resample_to_uniform,
-                target_dx=target_dx,
-            )
-    # --- Median filter grid
-    for win_lm in (10, 15, 20, 25, 50):
-        labelm = f"median:window_{win_lm}"
-        methods[labelm] = dict(
-            method="median",
-            window_length=win_lm,
-            x=x_arr,
-            resample_to_uniform=resample_to_uniform,
-            target_dx=target_dx
-        )
-    methods["none"] = dict(method="none", x=x_arr, resample_to_uniform=False, target_dx=None)
+    methods = _build_denoising_method_grid(
+        x_arr,
+        resample_to_uniform=resample_to_uniform,
+        target_dx=target_dx,
+        include_derivatives=include_derivatives,
+    )
 
     # --- Evaluate all methods (optionally in parallel). Process pools need a picklable wrapper.
     rows_peak: List[Dict[str, Any]] = []
@@ -804,6 +921,7 @@ def compare_denoising_methods(
     arg_tuples: List[Tuple[Any, ...]] = [
         (
             name, cfg_slim, x_arr, y_arr, ref_meas, rel_height, search_ppm,
+            float(match_min_prominence_ratio), float(match_min_prominence_abs), float(match_min_width_pts),
             baseline_mask, sigma_raw_global, local_sigma_raw,
             hf_enabled, hf_cutoff_hz, hf_cutoff_frac, hf_resample_dx,
             hf_power_raw_global, float(flank_inner), float(flank_outer),
@@ -937,6 +1055,83 @@ def compare_denoising_methods(
         raise ValueError("return_format must be 'pandas' or 'polars'")
 
 
+def aggregate_method_summaries(
+    summary,
+    *,
+    unit_label: str = "windows",
+    return_format: Literal["pandas", "polars"] = "pandas",
+):
+    """Aggregate per-method summaries across windows, spectra, or other units.
+
+    The aggregation intentionally gives each unit equal weight by taking the
+    median of unit-level metrics, while match fractions remain peak-weighted.
+    This avoids a single busy window or spectrum dominating the ranking.
+    """
+    if pl is not None and isinstance(summary, pl.DataFrame):
+        df = summary.to_pandas()
+    else:
+        df = summary.copy()
+
+    if "method" not in df.columns:
+        raise KeyError("summary must contain a 'method' column")
+
+    metric_cols = (
+        "mz_shift_med",
+        "mz_shift_iqr",
+        "pct_height_med",
+        "pct_height_iqr",
+        "pct_fwhm_med",
+        "pct_fwhm_iqr",
+        "pct_area_med",
+        "pct_area_iqr",
+        "sigma_raw_global",
+        "sigma_new_global",
+        "noise_reduction_db",
+        "delta_snr_db_med",
+        "delta_snr_db_iqr",
+        "hf_power_reduction_db",
+        "hf_frac_new_global",
+    )
+
+    def _median_col(group: "pd.DataFrame", col: str) -> float:
+        if col not in group.columns:
+            return np.nan
+        s = pd.to_numeric(group[col], errors="coerce")
+        return float(s.median()) if s.notna().any() else np.nan
+
+    def _sum_int(group: "pd.DataFrame", col: str, default: int = 0) -> int:
+        if col not in group.columns:
+            return int(default)
+        s = pd.to_numeric(group[col], errors="coerce")
+        return int(s.fillna(0).sum())
+
+    rows = []
+    for method, grp in df.groupby("method", sort=True):
+        peaks_total = _sum_int(grp, "peaks_total")
+        peaks_matched = _sum_int(grp, "peaks_matched")
+        peaks_lost = _sum_int(grp, "peaks_lost", default=max(peaks_total - peaks_matched, 0))
+        row = {
+            "method": method,
+            unit_label: int(grp.shape[0]),
+            "peaks_total": peaks_total,
+            "peaks_matched": peaks_matched,
+            "peaks_lost": peaks_lost,
+            "frac_matched": (peaks_matched / peaks_total) if peaks_total else np.nan,
+        }
+        for col in metric_cols:
+            row[col] = _median_col(grp, col)
+        rows.append(row)
+
+    out = pd.DataFrame(rows).sort_values("method").reset_index(drop=True)
+    if return_format == "pandas":
+        return out
+    if return_format == "polars":
+        if pl is None:
+            raise ImportError("polars is not installed. Install it or use return_format='pandas'.")
+        return pl.DataFrame(out)
+    raise ValueError("return_format must be 'pandas' or 'polars'")
+
+
 # Multi-window helper (stratified evaluation):
 # a thin wrapper that loops over windows, tags results, and concatenates:
 
@@ -950,7 +1145,11 @@ def compare_methods_in_windows(
     min_prominence: Optional[float] = None,
     rel_height: float = 0.5,
     search_ppm: float = 20.0,
+    match_min_prominence_ratio: float = 0.1,
+    match_min_prominence_abs: float = 0.0,
+    match_min_width_pts: float = 0.25,
     resample_to_uniform: bool = False,
+    include_derivatives: bool = False,
     target_dx: Optional[float] = None,
     return_format: Literal["pandas", "polars"] = "pandas",
     n_jobs: int = -1,
@@ -965,6 +1164,8 @@ def compare_methods_in_windows(
     hf_resample_dx: Optional[float] = None,
     hf_psd_method: Literal["welch","periodogram"] = "welch",
     hf_welch_nperseg: Optional[int] = None,
+    auto_tune: bool = False,
+    auto_tune_files: Optional[list[str]] = None,
 ):
     """Evaluate denoising methods across multiple m/z windows and aggregate results.
 
@@ -982,8 +1183,13 @@ def compare_methods_in_windows(
         Relative height used to define FWHM when measuring peaks.
     search_ppm : float, default 20.0
         ±ppm window around each reference m/z used to re-detect peaks after denoising.
+    match_min_prominence_ratio, match_min_prominence_abs, match_min_width_pts : floats
+        Forwarded to the peak re-matching logic used after denoising.
     resample_to_uniform, target_dx : optional
         Passed through to denoisers that support resampling.
+    include_derivatives : bool, default False
+        If True, include derivative-style Savitzky-Golay and Gaussian
+        candidates inside each window's method grid.
     return_format : {"pandas","polars"}
         Backend for output DataFrames.
     n_jobs : int, default -1
@@ -1009,6 +1215,14 @@ def compare_methods_in_windows(
     If return_format == "polars":
         rollup, summary_all, detail_all : pl.DataFrame
     """
+    if auto_tune:
+        from ..adaptive import estimate_denoise_params
+        _dn_overrides = estimate_denoise_params(auto_tune_files or [])
+        if "hf_cutoff_frac" in _dn_overrides:
+            hf_cutoff_frac = float(_dn_overrides["hf_cutoff_frac"])
+        if "max_peaks" in _dn_overrides:
+            per_window_max_peaks = int(_dn_overrides["max_peaks"])
+
     if return_format == "pandas":
         import pandas as pd
         summaries = []
@@ -1021,7 +1235,11 @@ def compare_methods_in_windows(
                 min_prominence=min_prominence,
                 rel_height=rel_height,
                 search_ppm=search_ppm,
+                match_min_prominence_ratio=match_min_prominence_ratio,
+                match_min_prominence_abs=match_min_prominence_abs,
+                match_min_width_pts=match_min_width_pts,
                 resample_to_uniform=resample_to_uniform,
+                include_derivatives=include_derivatives,
                 target_dx=target_dx,
                 return_format="pandas",
                 n_jobs=n_jobs, parallel_backend=parallel_backend, progress=progress,
@@ -1044,21 +1262,10 @@ def compare_methods_in_windows(
 
         summary_all = pd.concat(summaries, ignore_index=True)
         detail_all = pd.concat(details,   ignore_index=True)
-
-        rollup = (
-            summary_all.groupby("method", as_index=False)
-            .apply(lambda g: pd.Series({
-                "windows": g.shape[0],
-                "peaks_total": int(g["peaks_total"].sum()),
-                "peaks_matched": int(g["peaks_matched"].sum()),
-                "frac_matched_weighted": (g["peaks_matched"].sum() / g["peaks_total"].sum()
-                                          ) if g["peaks_total"].sum() else np.nan,
-                "pct_height_med_median": g["pct_height_med"].median(),
-                "pct_fwhm_med_median":   g["pct_fwhm_med"].median(),
-                "pct_area_med_median":   g["pct_area_med"].median(),
-                "mz_shift_med_median":   g["mz_shift_med"].median(),
-            }))
-            .reset_index(drop=True)
+        rollup = aggregate_method_summaries(
+            summary_all,
+            unit_label="windows",
+            return_format="pandas",
         )
         return rollup, summary_all, detail_all
 
@@ -1078,7 +1285,11 @@ def compare_methods_in_windows(
                 min_prominence=min_prominence,
                 rel_height=rel_height,
                 search_ppm=search_ppm,
+                match_min_prominence_ratio=match_min_prominence_ratio,
+                match_min_prominence_abs=match_min_prominence_abs,
+                match_min_width_pts=match_min_width_pts,
                 resample_to_uniform=resample_to_uniform,
+                include_derivatives=include_derivatives,
                 target_dx=target_dx,
                 return_format="polars",
                 n_jobs=n_jobs, parallel_backend=parallel_backend, progress=progress,
@@ -1099,21 +1310,10 @@ def compare_methods_in_windows(
 
         summary_all = pl.concat(summaries, how="vertical", rechunk=True)
         detail_all = pl.concat(details,   how="vertical", rechunk=True)
-
-        rollup = (
-            summary_all
-            .group_by("method")
-            .agg([
-                pl.count().alias("windows"),
-                pl.col("peaks_total").sum().alias("peaks_total"),
-                pl.col("peaks_matched").sum().alias("peaks_matched"),
-                (pl.col("peaks_matched").sum() / pl.col("peaks_total").sum()).alias("frac_matched_weighted"),
-                pl.col("pct_height_med").filter(~pl.col("pct_height_med").is_nan()
-                                                ).median().alias("pct_height_med_median"),
-                pl.col("pct_fwhm_med").filter(~pl.col("pct_fwhm_med").is_nan()).median().alias("pct_fwhm_med_median"),
-                pl.col("pct_area_med").filter(~pl.col("pct_area_med").is_nan()).median().alias("pct_area_med_median"),
-                pl.col("mz_shift_med").filter(~pl.col("mz_shift_med").is_nan()).median().alias("mz_shift_med_median"),
-            ])
+        rollup = aggregate_method_summaries(
+            summary_all,
+            unit_label="windows",
+            return_format="polars",
         )
         return rollup, summary_all, detail_all
 
@@ -1130,6 +1330,158 @@ def to_ppm(mz_shift_med: float, mz_ref_median: float) -> float:
     return 1e6 * mz_shift_med / mz_ref_median
 
 
+DEFAULT_SELECTION_CRITERIA: Dict[str, float] = {
+    "min_frac_matched": 0.80,
+    "max_mz_shift_ppm": 10.0,
+    "max_mz_shift_iqr_ppm": 10.0,
+    "max_pct_area_med": 25.0,
+    "max_pct_height_med": 25.0,
+    "max_pct_fwhm_med": 25.0,
+    "max_pct_area_iqr": 30.0,
+    "max_pct_height_iqr": 30.0,
+    "max_pct_fwhm_iqr": 30.0,
+    "target_noise_db": 3.0,
+    "target_delta_snr_db": 3.0,
+    "target_hf_power_reduction_db": 3.0,
+    "target_hf_frac_new_global": 0.25,
+}
+
+
+def _resolve_selection_criteria(
+    selection_criteria: Optional[Dict[str, float]] = None,
+) -> Dict[str, float]:
+    """Validate and merge dimensionless-selection criteria."""
+    criteria = dict(DEFAULT_SELECTION_CRITERIA)
+    if selection_criteria is not None:
+        unknown = set(selection_criteria) - set(criteria)
+        if unknown:
+            raise KeyError(f"Unknown selection criteria: {sorted(unknown)}")
+        criteria.update(selection_criteria)
+
+    for key, value in criteria.items():
+        if not np.isfinite(value):
+            raise ValueError(f"selection criterion '{key}' must be finite")
+
+    if not (0.0 < criteria["min_frac_matched"] <= 1.0):
+        raise ValueError("selection criterion 'min_frac_matched' must lie in (0, 1]")
+
+    positive_keys = set(criteria) - {"min_frac_matched"}
+    for key in positive_keys:
+        if criteria[key] <= 0:
+            raise ValueError(f"selection criterion '{key}' must be > 0")
+    return criteria
+
+
+def _prepare_ranking_frame_pandas(
+    summary_df,
+    per_peak_df,
+    *,
+    min_noise_db: float,
+    min_delta_snr_db: float,
+    selection_criteria: Optional[Dict[str, float]] = None,
+) -> pd.DataFrame:
+    """Add dimensionless ranking columns and pre-specified pass/fail gates."""
+    criteria = _resolve_selection_criteria(selection_criteria)
+    s = _to_pandas_df(summary_df)
+    peak_df = _to_pandas_df(per_peak_df)
+
+    numeric_cols = (
+        "frac_matched",
+        "mz_shift_med",
+        "mz_shift_iqr",
+        "pct_area_med",
+        "pct_area_iqr",
+        "pct_height_med",
+        "pct_height_iqr",
+        "pct_fwhm_med",
+        "pct_fwhm_iqr",
+        "noise_reduction_db",
+        "delta_snr_db_med",
+        "hf_power_reduction_db",
+        "hf_frac_new_global",
+    )
+    for col in numeric_cols:
+        if col not in s.columns:
+            s[col] = np.nan
+        s[col] = pd.to_numeric(s[col], errors="coerce")
+
+    for col in ("noise_reduction_db", "delta_snr_db_med", "hf_power_reduction_db", "hf_frac_new_global"):
+        s[col] = s[col].fillna(0.0)
+
+    mz_ref_median = np.nan
+    if "mz_ref" in peak_df.columns:
+        mz_ref = pd.to_numeric(peak_df["mz_ref"], errors="coerce").to_numpy(dtype=float)
+        if mz_ref.size and np.isfinite(mz_ref).any():
+            mz_ref_median = float(np.nanmedian(mz_ref))
+    ppm_scale = np.nan
+    if np.isfinite(mz_ref_median) and mz_ref_median != 0:
+        ppm_scale = 1e6 / mz_ref_median
+
+    s["mz_shift_ppm"] = s["mz_shift_med"].abs() * ppm_scale
+    s["mz_shift_iqr_ppm"] = s["mz_shift_iqr"].abs() * ppm_scale
+    s["abs_area"] = s["pct_area_med"].abs()
+    s["abs_height"] = s["pct_height_med"].abs()
+    s["abs_fwhm"] = s["pct_fwhm_med"].abs()
+    s["abs_area_iqr"] = s["pct_area_iqr"].abs()
+    s["abs_height_iqr"] = s["pct_height_iqr"].abs()
+    s["abs_fwhm_iqr"] = s["pct_fwhm_iqr"].abs()
+
+    s["scaled_mz_shift"] = s["mz_shift_ppm"] / criteria["max_mz_shift_ppm"]
+    s["scaled_mz_shift_iqr"] = s["mz_shift_iqr_ppm"] / criteria["max_mz_shift_iqr_ppm"]
+    s["scaled_abs_area"] = s["abs_area"] / criteria["max_pct_area_med"]
+    s["scaled_abs_height"] = s["abs_height"] / criteria["max_pct_height_med"]
+    s["scaled_abs_fwhm"] = s["abs_fwhm"] / criteria["max_pct_fwhm_med"]
+    s["scaled_abs_area_iqr"] = s["abs_area_iqr"] / criteria["max_pct_area_iqr"]
+    s["scaled_abs_height_iqr"] = s["abs_height_iqr"] / criteria["max_pct_height_iqr"]
+    s["scaled_abs_fwhm_iqr"] = s["abs_fwhm_iqr"] / criteria["max_pct_fwhm_iqr"]
+    s["spread_sum_scaled"] = s[
+        [
+            "scaled_mz_shift_iqr",
+            "scaled_abs_area_iqr",
+            "scaled_abs_height_iqr",
+            "scaled_abs_fwhm_iqr",
+        ]
+    ].sum(axis=1, min_count=1)
+    s["scaled_noise_reduction"] = s["noise_reduction_db"] / criteria["target_noise_db"]
+    s["scaled_delta_snr"] = s["delta_snr_db_med"] / criteria["target_delta_snr_db"]
+    s["scaled_hf_power_reduction"] = (
+        s["hf_power_reduction_db"] / criteria["target_hf_power_reduction_db"]
+    )
+    s["scaled_hf_frac"] = s["hf_frac_new_global"] / criteria["target_hf_frac_new_global"]
+
+    pass_checks = {
+        "pass_frac_matched": s["frac_matched"] >= criteria["min_frac_matched"],
+        "pass_mz_shift_ppm": s["mz_shift_ppm"] <= criteria["max_mz_shift_ppm"],
+        "pass_mz_shift_iqr_ppm": s["mz_shift_iqr_ppm"] <= criteria["max_mz_shift_iqr_ppm"],
+        "pass_abs_area": s["abs_area"] <= criteria["max_pct_area_med"],
+        "pass_abs_height": s["abs_height"] <= criteria["max_pct_height_med"],
+        "pass_abs_fwhm": s["abs_fwhm"] <= criteria["max_pct_fwhm_med"],
+        "pass_abs_area_iqr": s["abs_area_iqr"] <= criteria["max_pct_area_iqr"],
+        "pass_abs_height_iqr": s["abs_height_iqr"] <= criteria["max_pct_height_iqr"],
+        "pass_abs_fwhm_iqr": s["abs_fwhm_iqr"] <= criteria["max_pct_fwhm_iqr"],
+        "pass_noise_reduction": s["noise_reduction_db"] >= float(min_noise_db),
+        "pass_delta_snr": s["delta_snr_db_med"] >= float(min_delta_snr_db),
+    }
+    for col, mask in pass_checks.items():
+        s[col] = mask
+
+    s["passes_peak_preservation"] = (
+        s["pass_frac_matched"]
+        & s["pass_mz_shift_ppm"]
+        & s["pass_mz_shift_iqr_ppm"]
+        & s["pass_abs_area"]
+        & s["pass_abs_height"]
+        & s["pass_abs_fwhm"]
+        & s["pass_abs_area_iqr"]
+        & s["pass_abs_height_iqr"]
+        & s["pass_abs_fwhm_iqr"]
+    )
+    s["passes_min_denoise"] = s["pass_noise_reduction"] & s["pass_delta_snr"]
+    s["passes_selection_criteria"] = s["passes_peak_preservation"] & s["passes_min_denoise"]
+    fail_cols = [col for col in pass_checks if col.startswith("pass_")]
+    s["failed_criteria_count"] = (~s[fail_cols]).sum(axis=1)
+    return s
+
 
 def rank_methods_pandas(summary_df,
                         per_peak_df,
@@ -1140,49 +1492,50 @@ def rank_methods_pandas(summary_df,
                         w_hf_db=1.5,
                         w_hf_frac=1.0,
                         min_noise_db=0.5,
-                        min_delta_snr_db=1.0):
-    """Rank methods (pandas) using noise-aware, peak-preservation scoring.
+                        min_delta_snr_db=1.0,
+                        selection_criteria: Optional[Dict[str, float]] = None):
+    """Rank methods using explicit gates plus a dimensionless tie-break score.
 
-    The score is a **penalty minus reward** formulation. Lower is better.
-    Penalties include ppm m/z shift, |%| distortions (height/area/FWHM), IQR spreads, and
-    residual high-frequency fraction. Rewards include fraction of peaks matched and
-    reductions in global noise (dB), local ΔSNR (dB), and high-frequency power (dB).
-
-    Methods that fail *minimum denoising* (`noise_reduction_db < min_noise_db` or
-    `delta_snr_db_med < min_delta_snr_db`) are demoted by a large constant so they cannot win.
+    The primary scientific selection rule is:
+    1. Require peak-preservation and minimum-denoising criteria to pass.
+    2. Use a dimensionless score only as a secondary tie-break, not as the
+       primary scientific claim.
     """
-    mz_ref_median = float(np.nanmedian(per_peak_df['mz_ref'].values))
-    s = summary_df.copy()
-    s['mz_shift_ppm'] = s['mz_shift_med'].abs().apply(lambda v: to_ppm(v, mz_ref_median))
-    s['abs_area']   = s['pct_area_med'].abs()
-    s['abs_height'] = s['pct_height_med'].abs()
-    s['abs_fwhm']   = s['pct_fwhm_med'].abs()
-    s['spread_sum'] = s[['mz_shift_iqr','pct_area_iqr','pct_height_iqr','pct_fwhm_iqr']].abs().sum(axis=1)
-    for col in ('noise_reduction_db', 'delta_snr_db_med', 'hf_power_reduction_db', 'hf_frac_new_global'):
-        if col not in s:
-            s[col] = 0.0
-    s[['noise_reduction_db','delta_snr_db_med','hf_power_reduction_db','hf_frac_new_global']] = (
-        s[['noise_reduction_db','delta_snr_db_med','hf_power_reduction_db','hf_frac_new_global']].fillna(0.0)
+    s = _prepare_ranking_frame_pandas(
+        summary_df,
+        per_peak_df,
+        min_noise_db=min_noise_db,
+        min_delta_snr_db=min_delta_snr_db,
+        selection_criteria=selection_criteria,
     )
-    penalty = (w_mz*s['mz_shift_ppm']
-               + w_area*s['abs_area']
-               + w_height*s['abs_height']
-               + w_fwhm*s['abs_fwhm']
-               + w_spread*s['spread_sum']
-               + w_hf_frac*s['hf_frac_new_global'])
-    reward = (w_match*(s['frac_matched']*100.0)
-              + w_noise_db*s['noise_reduction_db']
-              + w_delta_snr_db*s['delta_snr_db_med']
-              + w_hf_db*s['hf_power_reduction_db'])
-    s['score'] = penalty - reward
-    # Hard constraint: methods that fail minimum denoising are pushed to bottom
-    fail_mask = (s['noise_reduction_db'] < min_noise_db) | (s['delta_snr_db_med'] < min_delta_snr_db)
-    s['passes_min_denoise'] = ~fail_mask
-    s.loc[fail_mask, 'score'] = s.loc[fail_mask, 'score'] + 1_000_000.0
-    s = s.sort_values('score', ascending=True).reset_index(drop=True)
+
+    penalty_fill = 10.0
+    penalty = (
+        w_mz * s["scaled_mz_shift"].fillna(penalty_fill)
+        + w_area * s["scaled_abs_area"].fillna(penalty_fill)
+        + w_height * s["scaled_abs_height"].fillna(penalty_fill)
+        + w_fwhm * s["scaled_abs_fwhm"].fillna(penalty_fill)
+        + w_spread * s["spread_sum_scaled"].fillna(penalty_fill)
+        + w_hf_frac * s["scaled_hf_frac"].fillna(penalty_fill)
+    )
+    reward = (
+        w_match * s["frac_matched"].fillna(0.0)
+        + w_noise_db * s["scaled_noise_reduction"].fillna(0.0)
+        + w_delta_snr_db * s["scaled_delta_snr"].fillna(0.0)
+        + w_hf_db * s["scaled_hf_power_reduction"].fillna(0.0)
+    )
+    s["selection_penalty"] = penalty
+    s["selection_reward"] = reward
+    s["selection_score"] = penalty - reward
+    s["score"] = s["selection_score"]
+
+    fail_mask = ~s["passes_selection_criteria"]
+    s.loc[fail_mask, "score"] = s.loc[fail_mask, "score"] + 1_000_000.0
+    s = s.sort_values(
+        ["score", "delta_snr_db_med", "frac_matched"],
+        ascending=[True, False, False],
+    ).reset_index(drop=True)
     return s
-
-
 
 
 def rank_methods_polars(summary_df: "pl.DataFrame", per_peak_df: "pl.DataFrame",
@@ -1193,52 +1546,29 @@ def rank_methods_polars(summary_df: "pl.DataFrame", per_peak_df: "pl.DataFrame",
                         w_hf_db=1.5,
                         w_hf_frac=1.0,
                         min_noise_db: float = 0.5,
-                        min_delta_snr_db: float = 1.0) -> "pl.DataFrame":
-    """Rank methods (polars) using the same noise-aware objective as pandas.
-
-    See `rank_methods_pandas` for the semantics of each weight and constraint.
-    Returns a polars DataFrame sorted by ascending score.
-    """
+                        min_delta_snr_db: float = 1.0,
+                        selection_criteria: Optional[Dict[str, float]] = None) -> "pl.DataFrame":
+    """Rank methods (polars) using the pandas implementation for identical semantics."""
     if pl is None:
         raise ImportError("polars is not installed. Install it or use rank_methods_pandas instead.")
-    mz_ref_median = float(per_peak_df.select(pl.col('mz_ref').median()).item())
-    return (
-        summary_df
-        .with_columns([
-            (pl.col('mz_shift_med').abs() * (1e6 / mz_ref_median)).alias('mz_shift_ppm'),
-            pl.col('pct_area_med').abs().alias('abs_area'),
-            pl.col('pct_height_med').abs().alias('abs_height'),
-            pl.col('pct_fwhm_med').abs().alias('abs_fwhm'),
-            (pl.col('mz_shift_iqr').abs()
-             + pl.col('pct_area_iqr').abs()
-             + pl.col('pct_height_iqr').abs()
-             + pl.col('pct_fwhm_iqr').abs()).alias('spread_sum'),
-            pl.col('noise_reduction_db').fill_null(0.0).alias('noise_reduction_db'),
-            pl.col('delta_snr_db_med').fill_null(0.0).alias('delta_snr_db_med'),
-            pl.col("hf_power_reduction_db").fill_null(0.0).alias("hf_power_reduction_db"),
-            pl.col("hf_frac_new_global").fill_null(0.0).alias("hf_frac_new_global"),
-        ])
-        .with_columns([
-            (
-                (w_mz*pl.col('mz_shift_ppm')
-                 + w_area*pl.col('abs_area')
-                 + w_height*pl.col('abs_height')
-                 + w_fwhm*pl.col('abs_fwhm')
-                 + w_spread*pl.col('spread_sum')
-                 + w_hf_frac*pl.col('hf_frac_new_global'))
-                - (w_match*(pl.col('frac_matched')*100.0)
-                   + w_noise_db*pl.col('noise_reduction_db')
-                   + w_delta_snr_db*pl.col('delta_snr_db_med')
-                   + w_hf_db*pl.col('hf_power_reduction_db'))
-            ).alias('score'),
-        ])
-        .with_columns([
-            (((pl.col('noise_reduction_db') < min_noise_db) | (pl.col('delta_snr_db_med') < min_delta_snr_db)).alias('fail_min_denoise')),
-            pl.when(pl.col('fail_min_denoise')).then(pl.col('score') + 1_000_000.0).otherwise(pl.col('score')).alias('score')
-        ])
-        .with_columns((~pl.col('fail_min_denoise')).alias('passes_min_denoise'))
-        .sort('score')
+    ranked = rank_methods_pandas(
+        summary_df.to_pandas(),
+        per_peak_df.to_pandas(),
+        w_match=w_match,
+        w_mz=w_mz,
+        w_area=w_area,
+        w_height=w_height,
+        w_fwhm=w_fwhm,
+        w_spread=w_spread,
+        w_noise_db=w_noise_db,
+        w_delta_snr_db=w_delta_snr_db,
+        w_hf_db=w_hf_db,
+        w_hf_frac=w_hf_frac,
+        min_noise_db=min_noise_db,
+        min_delta_snr_db=min_delta_snr_db,
+        selection_criteria=selection_criteria,
     )
+    return pl.DataFrame(ranked)
 
 
 
@@ -1250,11 +1580,12 @@ def rank_method(input_format, summary_df, per_peak_df,
                 w_hf_db=1.5,
                 w_hf_frac=1.0,
                 min_noise_db: float = 0.5,
-                min_delta_snr_db: float = 1.0):
+                min_delta_snr_db: float = 1.0,
+                selection_criteria: Optional[Dict[str, float]] = None):
     """Dispatch ranking to pandas or polars implementation with identical semantics.
 
     Returns a DataFrame (pandas or polars) sorted by ascending `score` and includes
-    a boolean flag `passes_min_denoise` indicating whether each method met the hard constraints.
+    explicit pass/fail flags for denoising and peak-preservation criteria.
     """
     if input_format == 'pandas':
         summary = rank_methods_pandas(summary_df, per_peak_df,
@@ -1266,7 +1597,8 @@ def rank_method(input_format, summary_df, per_peak_df,
                         w_hf_db=w_hf_db,
                         w_hf_frac=w_hf_frac,
                         min_noise_db=min_noise_db,
-                        min_delta_snr_db=min_delta_snr_db)
+                        min_delta_snr_db=min_delta_snr_db,
+                        selection_criteria=selection_criteria)
     elif input_format == 'polars':
         summary = rank_methods_polars(summary_df, per_peak_df,
                         w_match=w_match, w_mz=w_mz, w_area=w_area,
@@ -1277,7 +1609,8 @@ def rank_method(input_format, summary_df, per_peak_df,
                         w_hf_db=w_hf_db,
                         w_hf_frac=w_hf_frac,
                         min_noise_db=min_noise_db,
-                        min_delta_snr_db=min_delta_snr_db)
+                        min_delta_snr_db=min_delta_snr_db,
+                        selection_criteria=selection_criteria)
     else:
         raise ValueError("input_format must be 'pandas' or 'polars'")
     return summary
@@ -1351,15 +1684,22 @@ def _normalize_and_filter(summary,
     if "pct_height_med" in df.columns:
         df["pct_height_med"] = pd.to_numeric(df["pct_height_med"], errors="coerce")
         df["abs_height"] = df["pct_height_med"].abs()
+    if "frac_matched" in df.columns:
+        df["frac_matched"] = pd.to_numeric(df["frac_matched"], errors="coerce")
     if "delta_snr_db_med" in df.columns:
         df["delta_snr_db_med"] = pd.to_numeric(df["delta_snr_db_med"], errors="coerce")
     if "score" in df.columns:
         df["score"] = pd.to_numeric(df["score"], errors="coerce")
+    if "selection_score" in df.columns:
+        df["selection_score"] = pd.to_numeric(df["selection_score"], errors="coerce")
 
     # Apply *identical* row filters everywhere
     mask = pd.Series(True, index=df.index)
-    if require_pass and "passes_min_denoise" in df.columns:
-        mask &= (df["passes_min_denoise"] == True)  # noqa: E712
+    if require_pass:
+        if "passes_selection_criteria" in df.columns:
+            mask &= (df["passes_selection_criteria"] == True)  # noqa: E712
+        elif "passes_min_denoise" in df.columns:
+            mask &= (df["passes_min_denoise"] == True)  # noqa: E712
 
     if require_finite_metrics:
         # These are needed for Pareto and usually for quality ranking
@@ -1407,7 +1747,7 @@ def _compute_pareto_mask(df):
 
 
 def select_methods(summary,
-                   basis="pareto_then_score",  # or "score"
+                   basis="constrained_pareto_then_snr",
                    top_k=12,
                    require_pass=True,
                    require_finite_metrics=True):
@@ -1425,6 +1765,25 @@ def select_methods(summary,
             raise ValueError("basis='score' requires a 'score' column")
         selected_df = df.sort_values(["score", "delta_snr_db_med"], ascending=[True, False]).head(top_k).copy()
 
+    elif basis in {"constrained_pareto_then_snr", "pareto_then_snr"}:
+        nd_mask = _compute_pareto_mask(df)
+        frontier_df = df[nd_mask].copy()
+        frontier_df = frontier_df.sort_values(["abs_height", "delta_snr_db_med"], ascending=[True, False])
+        frontier_df = frontier_df.drop_duplicates(subset=["abs_height"], keep="first")
+
+        order = ["delta_snr_db_med"]
+        ascending = [False]
+        if "frac_matched" in frontier_df.columns:
+            order.append("frac_matched")
+            ascending.append(False)
+        if "selection_score" in frontier_df.columns:
+            order.append("selection_score")
+            ascending.append(True)
+        elif "score" in frontier_df.columns:
+            order.append("score")
+            ascending.append(True)
+        selected_df = frontier_df.sort_values(order, ascending=ascending).head(top_k).copy()
+
     elif basis == "pareto_then_score":
         nd_mask = _compute_pareto_mask(df)
         frontier_df = df[nd_mask].copy()
@@ -1438,14 +1797,17 @@ def select_methods(summary,
         else:
             selected_df = frontier_df.sort_values("delta_snr_db_med", ascending=False).head(top_k).copy()
     else:
-        raise ValueError("basis must be 'pareto_then_score' or 'score'")
+        raise ValueError(
+            "basis must be one of "
+            "'constrained_pareto_then_snr', 'pareto_then_snr', 'pareto_then_score', or 'score'"
+        )
 
     return df, frontier_df, selected_df
 
 
 def plot_pareto_delta_snr_vs_height(summary, annotate=True, top_k=12,
                                     out_path=None, ax=None,
-                                    basis="pareto_then_score",
+                                    basis="constrained_pareto_then_snr",
                                     require_pass=True, require_finite_metrics=True,
                                     save_plot=True, save_pareto=True):
     """Render ΔSNR vs. |%height| with Pareto annotations.
@@ -1456,10 +1818,24 @@ def plot_pareto_delta_snr_vs_height(summary, annotate=True, top_k=12,
     """
     import matplotlib.pyplot as plt
 
-    df, frontier_df, selected_df = select_methods(
-        summary, basis=basis, top_k=top_k,
-        require_pass=require_pass, require_finite_metrics=require_finite_metrics
-    )
+    relaxed_for_plot = False
+    try:
+        df, frontier_df, selected_df = select_methods(
+            summary, basis=basis, top_k=top_k,
+            require_pass=require_pass, require_finite_metrics=require_finite_metrics
+        )
+    except ValueError as exc:
+        if require_pass and "No rows left after normalization/filters" in str(exc):
+            df, frontier_df, selected_df = select_methods(
+                summary,
+                basis=basis,
+                top_k=top_k,
+                require_pass=False,
+                require_finite_metrics=require_finite_metrics,
+            )
+            relaxed_for_plot = True
+        else:
+            raise
 
     created_fig = False
     if ax is None:
@@ -1474,7 +1850,10 @@ def plot_pareto_delta_snr_vs_height(summary, annotate=True, top_k=12,
 
     ax.set_xlabel("|% height change| (median)")
     ax.set_ylabel("ΔSNR (dB, median)")
-    ax.set_title("Pareto: ΔSNR vs. |%height| (lower x, higher y is better)")
+    title = "Pareto: ΔSNR vs. |%height| (lower x, higher y is better)"
+    if relaxed_for_plot:
+        title += "\nNo methods passed the current selection criteria; showing all finite candidates"
+    ax.set_title(title)
     ax.grid(True, alpha=0.2)
     ax.legend()
 
@@ -1485,12 +1864,10 @@ def plot_pareto_delta_snr_vs_height(summary, annotate=True, top_k=12,
                         xytext=(4, 4), textcoords="offset points")
 
     if save_plot:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_path = OUTPUT_DIR / f"Pareto_plot_top_{top_k}_{timestamp}.pdf"
+        out_path = OUTPUT_DIR / f"Pareto_plot_top_{top_k}.pdf"
         ax.figure.savefig(out_path, bbox_inches="tight")
     if save_pareto and frontier_df is not None:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_path = OUTPUT_DIR / f"Pareto_front_{top_k}_{timestamp}.xlsx"
+        out_path = OUTPUT_DIR / f"Pareto_front_{top_k}.xlsx"
         if _POLARS_AVAILABLE and isinstance(frontier_df, pl.DataFrame):
             frontier_df.write_excel(out_path)
         else:

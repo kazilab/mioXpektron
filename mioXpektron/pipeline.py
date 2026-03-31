@@ -12,6 +12,27 @@ from .utils.file_management import import_data
 from .normalization.normalization import tic_normalization
 from .utils.main import batch_processing
 
+DEFAULT_REFERENCE_MASSES: List[float] = [
+    1.0072764666,   # H+
+    15.0229265168,  # CH3+
+    22.9892207021,  # Na+
+    27.0229265168,  # C2H3+
+    29.0385765812,  # C2H5+
+    38.9631579065,  # K+
+    41.0385765812,  # C3H5+
+    43.0542266457,  # C3H7+
+    57.0698767102,  # C4H9+
+    58.065674,      # C3H8N+
+    67.0548,        # C5H7+
+    71.0855267746,  # C5H11+
+    86.096976,      # C5H12N+
+    91.0542266457,  # C7H7+ (tropylium)
+    104.107539,     # C5H14NO+
+    184.073320,     # C5H15NO4P+ (phosphocholine)
+    224.105171,     # C8H19NO4P+
+    369.351600,     # C27H45+ (cholesterol)
+]
+
 
 @dataclass
 class PipelineConfig:
@@ -42,6 +63,9 @@ class PipelineConfig:
     # Parallelism
     max_workers: Optional[int] = None
 
+    # Adaptive parameterization (opt-in)
+    auto_tune: bool = False
+
 
 def _maybe_recalibrate(
     files: Sequence[str],
@@ -57,10 +81,7 @@ def _maybe_recalibrate(
         return list(files)
 
     cal_cfg = AutoCalibConfig(
-        reference_masses=(cfg.reference_masses or [
-            1.00782503224, 22.9897692820, 38.9637064864, 58.065674,
-            86.096974, 104.107539, 184.073871, 224.105171
-        ]),
+        reference_masses=(cfg.reference_masses or DEFAULT_REFERENCE_MASSES),
         output_folder=cfg.output_folder_calibrated,
         max_workers=cfg.max_workers,
     )
@@ -129,6 +150,13 @@ def run_pipeline(
     (intensity_df, area_df) aligned by m/z across samples.
     """
     cfg = config or PipelineConfig()
+
+    if cfg.auto_tune:
+        from .adaptive import estimate_mz_tolerance, estimate_normalization_target
+        cfg.mz_tolerance = estimate_mz_tolerance(list(files))
+        cfg.normalization_target = estimate_normalization_target(
+            list(files), mz_min=cfg.mz_min, mz_max=cfg.mz_max,
+        )
 
     # 1) Optional recalibration
     working_files = _maybe_recalibrate(files, calib_channels_dict, cfg)

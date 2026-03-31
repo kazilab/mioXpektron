@@ -23,7 +23,6 @@ import time
 import warnings
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -183,7 +182,7 @@ def evaluate_one_method(
     t0 = time.perf_counter()
 
     # Methods that need a dataset-level reference
-    ref_needed = method in ("pqn", "median_of_ratios")
+    ref_needed = method in ("pqn", "median_of_ratios", "pareto", "mass_stratified_pqn")
     if ref_needed:
         if method == "pqn":
             reference = np.nanmedian(X_raw, axis=0)
@@ -193,6 +192,17 @@ def evaluate_one_method(
             log_means = np.nanmean(np.log(X_raw + 1.0), axis=0)
             reference = np.exp(log_means) - 1.0
             method_kwargs = {**method_kwargs, "reference": reference}
+        elif method == "pareto":
+            mean = np.nanmean(X_raw, axis=0)
+            std = np.nanstd(X_raw, axis=0, ddof=0)
+            method_kwargs = {**method_kwargs, "mean": mean, "std": std}
+        elif method == "mass_stratified_pqn":
+            reference = np.nanmedian(X_raw, axis=0)
+            method_kwargs = {
+                **method_kwargs,
+                "reference": reference,
+                "mz_values": mz_values,
+            }
 
     X_norm = np.empty_like(X_raw, dtype=float)
     for i in range(n_samples):
@@ -232,7 +242,7 @@ def evaluate_one_method(
         # Stability
         rng = np.random.default_rng(random_state)
         stab: List[float] = []
-        m = max(2, int(round(cluster_bootstrap_frac * n_samples)))
+        m = min(n_samples, max(2, int(round(cluster_bootstrap_frac * n_samples))))
         for _ in range(cluster_bootstrap_rounds):
             idx = rng.choice(n_samples, size=m, replace=False)
             km_sub = KMeans(n_clusters=n_clusters_actual, n_init="auto",
@@ -337,6 +347,8 @@ class NormalizationEvaluator:
     random_state: int = 0
     compute_supervised: bool = True
     n_jobs: int = -1
+    group_patterns: Optional[Dict[str, str]] = None
+    group_fn: Optional[Any] = None  # Callable[[str], str]
 
     # internal state
     _resolved_files: List[Path] = field(default_factory=list, init=False, repr=False)
@@ -379,9 +391,10 @@ class NormalizationEvaluator:
             if p.is_file():
                 paths.append(p.resolve())
             elif p.is_dir():
-                for hit in sorted(p.rglob("*.txt")):
-                    if hit.is_file():
-                        paths.append(hit.resolve())
+                for pattern in ("*.txt", "*.csv"):
+                    for hit in sorted(p.rglob(pattern)):
+                        if hit.is_file():
+                            paths.append(hit.resolve())
         return sorted(set(paths))
 
     # -- data loading ------------------------------------------------------
@@ -395,7 +408,9 @@ class NormalizationEvaluator:
         for fp in self._resolved_files:
             try:
                 mz, intensity, sample_name, group = import_data(
-                    str(fp), self.mz_min, self.mz_max
+                    str(fp), self.mz_min, self.mz_max,
+                    group_patterns=self.group_patterns,
+                    group_fn=self.group_fn,
                 )
                 if ref_mz is None:
                     ref_mz = mz
@@ -403,6 +418,12 @@ class NormalizationEvaluator:
                     logger.warning(
                         "Skipping %s: channel count %d != %d",
                         fp.name, len(mz), len(ref_mz),
+                    )
+                    continue
+                elif not np.allclose(mz, ref_mz, atol=1e-6):
+                    logger.warning(
+                        "Skipping %s: m/z grid mismatch (max delta %.4e)",
+                        fp.name, float(np.max(np.abs(mz - ref_mz))),
                     )
                     continue
                 spectra.append((sample_name, intensity))
@@ -519,46 +540,76 @@ class NormalizationEvaluator:
 
         # --- Composite scores ---
 
-        # 1. Combined (balanced)
-        #    40% spectral quality, 30% clustering, 20% supervised, 10% practical
-        res["score_combined"] = (
-            0.15 * res["z_cv_tic"] +
-            0.10 * res["z_sam"] +
-            0.10 * res["z_corr"] +
-            0.05 * res["z_dyn_range"] +
-            0.10 * res["z_ari"] +
-            0.10 * res["z_nmi"] +
-            0.10 * res["z_stability"] +
-            0.10 * res["z_f1"] +
-            0.10 * res["z_bal_acc"] +
-            0.05 * res["z_neg_frac"] +
-            0.05 * res["z_sil"]
+        # Check whether supervised metrics are available (not all NaN)
+        has_supervised = (
+            res["supervised_macro_f1"].notna().any()
+            and res["supervised_bal_acc"].notna().any()
         )
+
+        # Replace NaN z-scores with 0 so they don't poison weighted sums
+        def _z(col: str) -> pd.Series:
+            return res[col].fillna(0.0)
+
+        if has_supervised:
+            # 1. Combined (balanced)
+            #    40% spectral quality, 30% clustering, 20% supervised, 10% practical
+            res["score_combined"] = (
+                0.15 * _z("z_cv_tic") +
+                0.10 * _z("z_sam") +
+                0.10 * _z("z_corr") +
+                0.05 * _z("z_dyn_range") +
+                0.10 * _z("z_ari") +
+                0.10 * _z("z_nmi") +
+                0.10 * _z("z_stability") +
+                0.10 * _z("z_f1") +
+                0.10 * _z("z_bal_acc") +
+                0.05 * _z("z_neg_frac") +
+                0.05 * _z("z_sil")
+            )
+        else:
+            # Redistribute supervised weight (20%) to unsupervised components
+            logger.info(
+                "Supervised metrics unavailable; using unsupervised-only "
+                "weights for score_combined."
+            )
+            res["score_combined"] = (
+                0.20 * _z("z_cv_tic") +
+                0.15 * _z("z_sam") +
+                0.15 * _z("z_corr") +
+                0.10 * _z("z_dyn_range") +
+                0.15 * _z("z_ari") +
+                0.10 * _z("z_nmi") +
+                0.10 * _z("z_stability") +
+                0.05 * _z("z_neg_frac")
+            )
 
         # 2. Unsupervised (no labels needed — quality-focused)
         res["score_unsupervised"] = (
-            0.25 * res["z_cv_tic"] +
-            0.20 * res["z_sam"] +
-            0.20 * res["z_corr"] +
-            0.15 * res["z_stability"] +
-            0.10 * res["z_sil"] +
-            0.10 * res["z_dyn_range"]
+            0.25 * _z("z_cv_tic") +
+            0.20 * _z("z_sam") +
+            0.20 * _z("z_corr") +
+            0.15 * _z("z_stability") +
+            0.10 * _z("z_sil") +
+            0.10 * _z("z_dyn_range")
         )
 
-        # 3. Supervised-focused
-        res["score_supervised"] = (
-            0.25 * res["z_f1"] +
-            0.25 * res["z_bal_acc"] +
-            0.15 * res["z_ari"] +
-            0.15 * res["z_nmi"] +
-            0.10 * res["z_stability"] +
-            0.10 * res["z_cv_tic"]
-        )
+        # 3. Supervised-focused (NaN if supervised metrics are absent)
+        if has_supervised:
+            res["score_supervised"] = (
+                0.25 * _z("z_f1") +
+                0.25 * _z("z_bal_acc") +
+                0.15 * _z("z_ari") +
+                0.15 * _z("z_nmi") +
+                0.10 * _z("z_stability") +
+                0.10 * _z("z_cv_tic")
+            )
+        else:
+            res["score_supervised"] = np.nan
 
         # 4. Efficiency-aware
         res["score_efficient"] = (
             0.85 * res["score_combined"] +
-            0.15 * res["z_compute_time"]
+            0.15 * _z("z_compute_time")
         )
 
         return res.sort_values("score_combined", ascending=False).reset_index(drop=True)
@@ -590,7 +641,6 @@ class NormalizationEvaluator:
             raise ImportError("matplotlib is required for plotting.")
 
         res = self._results
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         out = OUTPUT_DIR / Path(out_dir)
         out.mkdir(parents=True, exist_ok=True)
         saved: List[Path] = []
@@ -613,7 +663,7 @@ class NormalizationEvaluator:
         ax.legend(frameon=False)
         ax.axhline(0, color="grey", lw=0.5, ls="--")
         fig.tight_layout()
-        saved.extend(self._save_fig(fig, out, f"composite_scores_{timestamp}", save))
+        saved.extend(self._save_fig(fig, out, "composite_scores", save))
 
         # --- 2. Metric box/bar plots ---
         metric_info = [
@@ -629,15 +679,17 @@ class NormalizationEvaluator:
                 continue
             fig, ax = plt.subplots(figsize=(9, 4.5))
             vals = res[col].values
+            x = np.arange(len(methods))
             colors = ["#2ca02c" if not lower_better else "#d62728"] * len(vals)
             best_idx = int(np.nanargmin(vals) if lower_better else np.nanargmax(vals))
             colors[best_idx] = "#1f77b4"
-            ax.bar(methods, vals, color=colors)
+            ax.bar(x, vals, color=colors)
             ax.set_title(title)
             ax.set_ylabel(col)
+            ax.set_xticks(x)
             ax.set_xticklabels(methods, rotation=45, ha="right")
             fig.tight_layout()
-            saved.extend(self._save_fig(fig, out, f"{col}_{timestamp}", save))
+            saved.extend(self._save_fig(fig, out, col, save))
 
         # --- 3. Overall ranking bar ---
         fig, ax = plt.subplots(figsize=(9, 4.5))
@@ -645,13 +697,12 @@ class NormalizationEvaluator:
         ax.set_xlabel("Combined score (higher = better)")
         ax.set_title("Overall Normalization Ranking")
         fig.tight_layout()
-        saved.extend(self._save_fig(fig, out, f"overall_ranking_{timestamp}", save))
+        saved.extend(self._save_fig(fig, out, "overall_ranking", save))
 
         # --- 4. Export CSVs ---
-        res.to_csv(out / f"normalization_eval_{timestamp}.csv", index=False)
+        res.to_csv(out / "normalization_eval.csv", index=False)
         summary = {
             "best_method": res.iloc[0]["method"],
-            "timestamp": timestamp,
             "n_spectra": int(self._X_raw.shape[0]) if self._X_raw is not None else 0,
             "n_channels": int(self._X_raw.shape[1]) if self._X_raw is not None else 0,
             "methods_evaluated": methods,
@@ -660,7 +711,7 @@ class NormalizationEvaluator:
                 for _, row in res.iterrows()
             },
         }
-        with open(out / f"summary_{timestamp}.json", "w") as f:
+        with open(out / "summary.json", "w") as f:
             json.dump(summary, f, indent=2)
 
         logger.info("Saved %d files to %s", len(saved) + 2, out)
@@ -754,7 +805,9 @@ class NormalizationEvaluator:
             raise ImportError("matplotlib is required for plotting.")
 
         mz, intensity, name, group = import_data(
-            str(file), mz_min or self.mz_min, mz_max or self.mz_max
+            str(file), mz_min or self.mz_min, mz_max or self.mz_max,
+            group_patterns=self.group_patterns,
+            group_fn=self.group_fn,
         )
 
         if methods is None:
@@ -775,13 +828,59 @@ class NormalizationEvaluator:
         for i, m in enumerate(methods[:max_methods]):
             kwargs = self.method_kwargs_map.get(m, {}) if self.method_kwargs_map else {}
 
+            def _project_dataset_vector(values: np.ndarray) -> np.ndarray:
+                values = np.asarray(values, dtype=float)
+                if self._mz is None or values.shape != np.asarray(self._mz).shape:
+                    return values
+                if len(self._mz) == len(mz) and np.allclose(self._mz, mz, atol=1e-6):
+                    return values
+                return np.interp(mz, self._mz, values, left=0.0, right=0.0)
+
+            if "reference_idx" in kwargs and self._mz is not None:
+                ref_idx = int(kwargs["reference_idx"])
+                if 0 <= ref_idx < len(self._mz):
+                    ref_mz = float(self._mz[ref_idx])
+                    kwargs = {
+                        **kwargs,
+                        "reference_idx": int(np.argmin(np.abs(mz - ref_mz))),
+                    }
+            if "reference_indices" in kwargs and self._mz is not None:
+                ref_indices = np.asarray(kwargs["reference_indices"], dtype=int)
+                mapped = []
+                for ref_idx in ref_indices:
+                    if 0 <= ref_idx < len(self._mz):
+                        ref_mz = float(self._mz[ref_idx])
+                        mapped.append(int(np.argmin(np.abs(mz - ref_mz))))
+                kwargs = {
+                    **kwargs,
+                    "reference_indices": mapped,
+                }
+
             # Build reference for dataset-level methods
             if m in ("pqn", "median_of_ratios") and self._X_raw is not None:
                 if m == "pqn":
-                    kwargs = {**kwargs, "reference": np.nanmedian(self._X_raw, axis=0)}
+                    kwargs = {
+                        **kwargs,
+                        "reference": _project_dataset_vector(np.nanmedian(self._X_raw, axis=0)),
+                    }
                 elif m == "median_of_ratios":
                     log_means = np.nanmean(np.log(self._X_raw + 1.0), axis=0)
-                    kwargs = {**kwargs, "reference": np.exp(log_means) - 1.0}
+                    kwargs = {
+                        **kwargs,
+                        "reference": _project_dataset_vector(np.exp(log_means) - 1.0),
+                    }
+            elif m == "pareto" and self._X_raw is not None:
+                kwargs = {
+                    **kwargs,
+                    "mean": _project_dataset_vector(np.nanmean(self._X_raw, axis=0)),
+                    "std": _project_dataset_vector(np.nanstd(self._X_raw, axis=0, ddof=0)),
+                }
+            elif m == "mass_stratified_pqn" and self._X_raw is not None:
+                kwargs = {
+                    **kwargs,
+                    "reference": _project_dataset_vector(np.nanmedian(self._X_raw, axis=0)),
+                    "mz_values": mz,
+                }
 
             try:
                 norm = normalize(intensity, method=m, **kwargs)
@@ -795,11 +894,10 @@ class NormalizationEvaluator:
         fig.tight_layout()
 
         if save_to:
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             save_dir = OUTPUT_DIR / Path(save_to)
             save_dir.mkdir(parents=True, exist_ok=True)
             for ext in (".png", ".pdf"):
-                fig.savefig(save_dir / f"preview_{name}_{ts}{ext}",
+                fig.savefig(save_dir / f"preview_{name}{ext}",
                             bbox_inches="tight", dpi=300)
         plt.show()
 

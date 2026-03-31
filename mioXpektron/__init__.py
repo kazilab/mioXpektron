@@ -1,6 +1,6 @@
 """Public package interface for the Xpektron toolkit."""
 
-__version__ = "0.0.2"
+__version__ = "0.0.3"
 
 # Core imports (always work)
 from . import recalibrate, utils
@@ -64,6 +64,7 @@ try:
         normalize,
         normalization_method_names,
         normalization_target,
+        resample_spectrum,
         tic_normalization,
         BatchTicNorm,
         NormalizationEvaluator,
@@ -95,10 +96,27 @@ from .recalibrate import (
 from .utils import import_data
 
 try:
-    from .pipeline import run_pipeline, PipelineConfig
+    from .pipeline import run_pipeline, PipelineConfig, DEFAULT_REFERENCE_MASSES
 except ImportError:
     run_pipeline = None
     PipelineConfig = None
+    DEFAULT_REFERENCE_MASSES = None
+
+try:
+    from .adaptive import (
+        auto_tune_calib_config,
+        estimate_autodetect_tolerance,
+        estimate_bootstrap_heuristics,
+        estimate_denoise_params,
+        estimate_flat_params,
+        estimate_multisegment_breakpoints,
+        estimate_mz_tolerance,
+        estimate_normalization_target,
+        estimate_outlier_threshold,
+        estimate_screening_thresholds,
+    )
+except ImportError:
+    auto_tune_calib_config = None
 
 __all__ = [
     "AggregateParams",
@@ -136,6 +154,7 @@ __all__ = [
     "plot_pareto_delta_snr_vs_height",
     "plotting",
     "rank_method",
+    "resample_spectrum",
     "select_methods",
     "recalibrate",
     "robust_noise_estimation",
@@ -148,7 +167,6 @@ __all__ = [
     "PipelineConfig",
     "AutoCalibrator",
     "AutoCalibConfig",
-    "PlotPeak",
     "PlotPeaks",
     "PlotPeaksConfig",
     "plot_overlapping_peaks",
@@ -159,5 +177,16 @@ __all__ = [
     "normalization_method_names",
     "NormalizationEvaluator",
     "NormalizationMethods",
-    "PeakAlignIntensityArea"
+    "PeakAlignIntensityArea",
+    "DEFAULT_REFERENCE_MASSES",
+    "auto_tune_calib_config",
+    "estimate_autodetect_tolerance",
+    "estimate_bootstrap_heuristics",
+    "estimate_denoise_params",
+    "estimate_flat_params",
+    "estimate_multisegment_breakpoints",
+    "estimate_mz_tolerance",
+    "estimate_normalization_target",
+    "estimate_outlier_threshold",
+    "estimate_screening_thresholds",
 ]

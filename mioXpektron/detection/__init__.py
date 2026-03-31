@@ -11,6 +11,7 @@ from .detection import (
     PeakAlignIntensityArea,
     robust_noise_estimation,
     robust_noise_estimation_mz,
+    robust_noise_estimation_mz_dependent,
     robust_peak_detection,
 )
 
@@ -25,5 +26,6 @@ __all__ = [
     "PeakAlignIntensityArea",
     "robust_noise_estimation",
     "robust_noise_estimation_mz",
+    "robust_noise_estimation_mz_dependent",
     "robust_peak_detection",
 ]

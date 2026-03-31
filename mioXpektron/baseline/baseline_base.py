@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
+import ast
 import inspect
 import io
 import re
@@ -120,6 +121,41 @@ def small_param_grid_preset(n_points: Optional[int] = None) -> Dict[str, List[Di
         "adaptive_window": [{"window_size": ws} for ws in window_sizes],
     }
 
+
+def _split_method_and_inline_kwargs(method: str) -> Tuple[str, Dict[str, object]]:
+    """Parse evaluator labels like ``aspls(lam=1000000.0)`` into a method spec."""
+    text = str(method).strip()
+    match = re.fullmatch(r"(?P<name>[^()]+?)\((?P<args>.*)\)", text)
+    if match is None:
+        return text, {}
+
+    base_name = match.group("name").strip()
+    args_text = match.group("args").strip()
+    if not args_text:
+        return base_name, {}
+
+    parsed: Dict[str, object] = {}
+    for item in args_text.split(","):
+        if "=" not in item:
+            return text, {}
+        key, raw_value = item.split("=", 1)
+        key = key.strip()
+        raw_value = raw_value.strip()
+        try:
+            value = ast.literal_eval(raw_value)
+        except (SyntaxError, ValueError):
+            lowered = raw_value.lower()
+            if lowered == "true":
+                value = True
+            elif lowered == "false":
+                value = False
+            elif lowered == "none":
+                value = None
+            else:
+                value = raw_value
+        parsed[key] = value
+    return base_name, parsed
+
 def baseline_correction(
     intensities: Union[np.ndarray, List[float]],
     method: str = "airpls",
@@ -156,7 +192,11 @@ def baseline_correction(
     if y.ndim != 1:
         raise ValueError("intensities must be 1‑D")  # pragma: no cover
 
-    method_lower = str(method).lower()
+    parsed_method, inline_kwargs = _split_method_and_inline_kwargs(str(method))
+    call_overrides = dict(inline_kwargs)
+    call_overrides.update(kwargs)
+
+    method_lower = parsed_method.lower()
     poly_like = {"poly", "modpoly", "imodpoly"}
     needs_rescale = method_lower in poly_like
     scale = 1.0
@@ -185,16 +225,16 @@ def baseline_correction(
 
     # custom filters
     if method_lower == "median_filter":
-        baseline = signal.medfilt(y, kernel_size=window_size)
+        baseline = signal.medfilt(y, kernel_size=int(call_overrides.get("window_size", window_size)))
     elif method_lower == "adaptive_window":
-        baseline = ndimage.minimum_filter1d(y, size=window_size)
+        baseline = ndimage.minimum_filter1d(y, size=int(call_overrides.get("window_size", window_size)))
     else:
-        func = dispatch.get(method_lower) or dispatch.get(method)
+        func = dispatch.get(method_lower) or dispatch.get(parsed_method)
         if func is None:
             raise ValueError(f"Unknown baseline method: {method}")
         input_y = y_for_baseline if needs_rescale else y
-        call_kwargs = kwargs
-        if kwargs:
+        call_kwargs = call_overrides
+        if call_overrides:
             try:
                 sig = inspect.signature(func)
             except (TypeError, ValueError):  # pragma: no cover - builtins without introspection
@@ -215,10 +255,10 @@ def baseline_correction(
                     valid_names.discard("self")
                     valid_names.discard("y")
                     if valid_names:
-                        filtered = {k: v for k, v in kwargs.items() if k in valid_names}
+                        filtered = {k: v for k, v in call_overrides.items() if k in valid_names}
                     else:
                         filtered = {}
-                    dropped = set(kwargs) - set(filtered)
+                    dropped = set(call_overrides) - set(filtered)
                     if dropped:
                         warnings.warn(
                             f"Ignoring unsupported baseline parameters {sorted(dropped)} for method '{method_lower}'",

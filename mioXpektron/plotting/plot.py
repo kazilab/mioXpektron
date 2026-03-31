@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Optional, Tuple
 from pathlib import Path
-from datetime import datetime
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -120,8 +119,7 @@ class PlotPeak:
         ax.legend()
         fig.tight_layout()
         if save_plot:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            out_path = OUTPUT_DIR / f"Intensity_plot_{self.sample_name}_{timestamp}.pdf"
+            out_path = OUTPUT_DIR / f"Intensity_plot_{self.sample_name}.pdf"
             fig.savefig(out_path, bbox_inches="tight")
         plt.show()
         return ax
@@ -186,7 +184,6 @@ class PlotPeak:
         ax.ticklabel_format(style="plain", axis="x")
         fig.tight_layout()
         if save_plot:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            out_path = OUTPUT_DIR / f"Intensity_zplot_{self.sample_name}_{timestamp}.pdf"
+            out_path = OUTPUT_DIR / f"Intensity_zplot_{self.sample_name}.pdf"
             plt.savefig(out_path, bbox_inches="tight")
         return fig

@@ -26,7 +26,7 @@ def local_centroid(mz: np.ndarray,
 
 def _tof_model(params: np.ndarray, m_true: np.ndarray) -> np.ndarray:
     """
-    Simple reflectron model: t = k*sqrt(m) + c*m + t0
+    Empirical TOF correction model: t = k*sqrt(m) + c*m + t0
     We invert it analytically (solve for m) when calibrating the spectrum.
     """
     k, c, t0 = params
@@ -71,7 +71,7 @@ def calibrate_spectrum(mz: np.ndarray,
     ----------
     mz, intensity : 1-D numpy arrays of equal length
     standards     : iterable of reference masses (monoisotopic, in u)
-    mode          : "tof" (default) – reflectron ToF model
+    mode          : "tof" (default) – empirical TOF correction model
                     "poly"          – 2nd-order polynomial
     window_ppm    : search window for peak matching (±ppm)
 
