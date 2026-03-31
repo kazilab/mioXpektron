@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.abspath(".."))
 project = "mioXpektron"
 copyright = "2026, @kazilab.se"
 author = "Data Analysis Team @KaziLab.se"
-release = "0.0.2"
+release = "0.0.3"
 
 # -- General configuration ---------------------------------------------------
 

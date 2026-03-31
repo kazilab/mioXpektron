@@ -53,6 +53,7 @@ See the :doc:`quickstart` guide for a full walkthrough.
    :maxdepth: 2
    :caption: Module Reference
 
+   modules/adaptive
    modules/baseline
    modules/denoise
    modules/detection

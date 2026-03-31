@@ -4,7 +4,7 @@ Installation
 Requirements
 ------------
 
-- Python 3.8 or higher
+- Python 3.10 or higher
 
 mioXpektron depends on the scientific Python stack:
 
@@ -77,4 +77,4 @@ After installing, verify that mioXpektron is available:
 
    import mioXpektron as mx
    print(mx.__version__)
-   # 0.0.2
+   # 0.0.3

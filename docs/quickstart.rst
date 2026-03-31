@@ -114,6 +114,37 @@ For batch processing, use the built-in pipeline that chains all steps:
 The pipeline returns two DataFrames: an intensity matrix and an area matrix,
 both aligned by m/z across all samples.
 
+Adaptive Parameterization
+-------------------------
+
+Set ``auto_tune=True`` to let the pipeline derive optimal thresholds from
+your data instead of using fixed defaults:
+
+.. code-block:: python
+
+   from mioXpektron import FlexibleCalibrator, FlexibleCalibConfig
+
+   config = FlexibleCalibConfig(
+       reference_masses=[1.0073, 27.0229, 29.0386, 41.0386, 57.0699, 104.1075],
+       calibration_method="quad_sqrt",
+       auto_tune=True,
+   )
+
+   calibrator = FlexibleCalibrator(config)
+   summary = calibrator.calibrate(file_list)
+
+The pipeline also supports this flag:
+
+.. code-block:: python
+
+   config = PipelineConfig(auto_tune=True)
+   intensity_df, area_df = run_pipeline(files, config=config)
+
+When ``auto_tune`` is active, parameters like calibration tolerance,
+outlier threshold, screening thresholds, normalization target, and
+alignment tolerance are estimated from the spectra. See
+:doc:`modules/adaptive` for details on each estimator.
+
 Mass Calibration
 ----------------
 
@@ -169,10 +200,29 @@ Evaluate baseline correction approaches:
 
 .. code-block:: python
 
-   from mioXpektron import BaselineMethodEvaluator
+   import glob
+   import random
+   from mioXpektron import BaselineMethodEvaluator, ScanForFlatRegion
 
-   evaluator = BaselineMethodEvaluator()
-   best_method = evaluator.evaluate(data)
+   files = sorted(glob.glob("output_files/denoised_spectrums_*/*.txt"))
+   sample = sorted(random.Random(42).sample(files, min(10, len(files))))
+
+   windows = ScanForFlatRegion(files=sample).run()
+   param_grid = {
+       "pspline_lsrpls": [{"lam": 1e6}],
+       "pspline_drpls": [{"lam": 1e6}],
+       "aspls": [{"lam": 1e6}],
+       "imodpoly": [{"poly_order": 3}],
+   }
+
+   evaluator = BaselineMethodEvaluator(
+       files=sample,
+       methods=list(param_grid),
+       param_grid=param_grid,
+       flat_windows=windows,
+   )
+   summary = evaluator.evaluate()
+   best_method = summary["overall_best_spec"]
 
 Evaluate normalization strategies:
 
@@ -181,17 +231,28 @@ Evaluate normalization strategies:
    from mioXpektron import NormalizationEvaluator
 
    evaluator = NormalizationEvaluator(
-       files=["spectra/*.txt"],
-       methods=["tic", "median", "rms", "poisson", "sqrt", "vsn"],
+       files=["spectra/"],
+       methods=["tic", "robust_snv", "pqn", "mass_stratified_pqn", "log"],
+       method_kwargs_map={
+           "mass_stratified_pqn": {
+               "strata": [(0.0, 100.0), (100.0, 400.0), (400.0, float("inf"))],
+           },
+       },
    )
    results = evaluator.evaluate()
    evaluator.print_summary()
    evaluator.plot()
 
+For baseline-corrected CSV cohorts, use the repository notebook
+``NoteBooks/_06_Normalization.ipynb`` to resample spectra onto a shared m/z
+grid before ranking methods. The notebook includes ``mass_stratified_pqn`` by
+default and can enable ``multi_ion_reference`` when reference ions are known.
+
 Next Steps
 ----------
 
 - :doc:`pipeline` --- detailed pipeline configuration reference
+- :doc:`modules/adaptive` --- data-driven adaptive parameterization
 - :doc:`modules/index` --- in-depth module documentation
 - :doc:`modules/calibration` --- calibration models and strategies
 - :doc:`modules/denoise` --- denoising algorithms and parameter tuning

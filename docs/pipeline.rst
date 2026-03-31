@@ -55,6 +55,9 @@ Configuration
 
        # Parallelism
        max_workers=None,             # None = use all available cores
+
+       # Adaptive parameterization (opt-in)
+       auto_tune=False,             # True = derive mz_tolerance and normalization_target from data
    )
 
 Running the Pipeline
@@ -97,6 +100,36 @@ The pipeline returns two ``pandas.DataFrame`` objects:
 
 Both DataFrames share the same m/z index, making them ready for downstream
 statistical analysis.
+
+Adaptive Parameterization
+-------------------------
+
+Set ``auto_tune=True`` to let the pipeline derive ``mz_tolerance`` and
+``normalization_target`` from the data instead of using hardcoded defaults:
+
+.. code-block:: python
+
+   config = PipelineConfig(auto_tune=True)
+   intensity_df, area_df = run_pipeline(files, config=config)
+
+When ``auto_tune`` is active the pipeline:
+
+1. Estimates ``mz_tolerance`` from median m/z spacing across a pilot sample.
+2. Estimates ``normalization_target`` from median raw TIC across the batch.
+
+All other parameters keep their defaults and can still be overridden manually.
+See :doc:`modules/adaptive` for details on each estimator.
+
+Reference Masses
+^^^^^^^^^^^^^^^^
+
+The pipeline now provides a canonical reference mass list
+``DEFAULT_REFERENCE_MASSES`` (18 ions) used as the fallback when
+``reference_masses`` is not provided. Import it directly:
+
+.. code-block:: python
+
+   from mioXpektron import DEFAULT_REFERENCE_MASSES
 
 PipelineConfig Reference
 ------------------------

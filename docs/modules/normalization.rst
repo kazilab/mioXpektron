@@ -1,10 +1,12 @@
 Normalization
 =============
 
-The normalization module provides 14 normalization strategies for ToF-SIMS
+The normalization module provides 18 normalization strategies for ToF-SIMS
 spectra, ranging from simple scaling (TIC, max) to variance-stabilising
-transforms (Poisson, sqrt, VSN) and robust methods (median, PQN).  An
-evaluation framework helps choose the best method for your dataset.
+transforms (Poisson, sqrt, VSN), robust methods (median, robust SNV, PQN),
+and reference-aware strategies such as selected-ion, multi-ion reference, and
+mass-stratified PQN. An evaluation framework helps choose the best method for
+your dataset.
 
 Quick Example
 -------------
@@ -16,7 +18,7 @@ Quick Example
    # TIC normalization (default)
    normalized = normalize(intensity, method="tic", target_tic=1e6)
 
-   # Or use any of 14 available methods
+   # Or use any of 18 available methods
    normalized = normalize(intensity, method="poisson")
 
 Available Methods
@@ -47,6 +49,9 @@ Available Methods
    * - ``snv``
      - Standard Normal Variate
      - Before PCA/PLS-DA; removes multiplicative scatter
+   * - ``robust_snv``
+     - Median/MAD SNV
+     - More robust than SNV when a few dominant peaks distort the mean/std
    * - ``poisson``
      - Poisson scaling
      - Before PCA on count data; equalises channel weights
@@ -65,12 +70,21 @@ Available Methods
    * - ``selected_ion``
      - Single-peak reference
      - Normalize to a known reference ion
+   * - ``multi_ion_reference``
+     - Robust multi-ion reference
+     - Normalize to a stable ion panel using a median ratio across reference ions
    * - ``pqn``
      - Probabilistic Quotient
      - Compositional effects; requires dataset reference
+   * - ``mass_stratified_pqn``
+     - Regional PQN
+     - Correct region-specific matrix effects across coarse m/z strata
    * - ``median_of_ratios``
      - DESeq2-style
      - Multi-batch experiments; requires geometric-mean reference
+   * - ``pareto``
+     - Dataset-level Pareto scaling
+     - Downstream multivariate analysis where mean-centering with reduced variance scaling is useful
 
 Method Details
 ^^^^^^^^^^^^^^
@@ -118,6 +132,50 @@ effects. Requires a reference spectrum (e.g. median of the dataset):
    reference = np.median(all_spectra, axis=0)
    normalized = normalize(intensity, method="pqn", reference=reference)
 
+**Robust SNV** --- Uses the median and median absolute deviation (MAD) instead
+of the mean and standard deviation:
+
+.. code-block:: python
+
+   normalized = normalize(intensity, method="robust_snv")
+
+**Multi-Ion Reference** --- Uses a panel of stable ions and a robust median
+ratio across the panel:
+
+.. code-block:: python
+
+   normalized = normalize(
+       intensity,
+       method="multi_ion_reference",
+       reference_indices=[120, 245, 910],
+       reference_values=[5200.0, 1800.0, 25000.0],
+   )
+
+**Mass-Stratified PQN** --- Applies PQN within coarse m/z windows while still
+using a dataset-level reference spectrum:
+
+.. code-block:: python
+
+   normalized = normalize(
+       intensity,
+       method="mass_stratified_pqn",
+       mz_values=mz,
+       reference=reference,
+       strata=[(0.0, 100.0), (100.0, 400.0), (400.0, float("inf"))],
+   )
+
+**Pareto Scaling** --- Requires dataset-level mean and standard deviation and
+is most useful for multivariate modelling rather than raw signal correction:
+
+.. code-block:: python
+
+   normalized = normalize(
+       intensity,
+       method="pareto",
+       mean=dataset_mean,
+       std=dataset_std,
+   )
+
 
 Unified Dispatcher
 ------------------
@@ -130,8 +188,10 @@ All methods are accessible through the :func:`normalize` function:
 
    # List available methods
    print(normalization_method_names())
-   # ['log', 'max', 'median', 'median_of_ratios', 'minmax', 'poisson',
-   #  'pqn', 'rms', 'selected_ion', 'snv', 'sqrt', 'tic', 'vector', 'vsn']
+   # ['log', 'mass_stratified_pqn', 'max', 'median', 'median_of_ratios',
+   #  'minmax', 'multi_ion_reference', 'pareto', 'poisson', 'pqn',
+   #  'rms', 'robust_snv', 'selected_ion', 'snv', 'sqrt', 'tic',
+   #  'vector', 'vsn']
 
    # Apply any method
    result = normalize(intensity, method="rms", target_rms=1.0)
@@ -149,8 +209,13 @@ approach from `xpectrass` adapted for ToF-SIMS:
    from mioXpektron import NormalizationEvaluator
 
    evaluator = NormalizationEvaluator(
-       files=["spectra/*.txt"],
-       methods=["tic", "median", "rms", "poisson", "sqrt", "vsn"],
+       files=["spectra/"],
+       methods=["tic", "robust_snv", "pqn", "mass_stratified_pqn", "log"],
+       method_kwargs_map={
+           "mass_stratified_pqn": {
+               "strata": [(0.0, 100.0), (100.0, 400.0), (400.0, float("inf"))],
+           },
+       },
    )
 
    # Run evaluation
@@ -161,6 +226,23 @@ approach from `xpectrass` adapted for ToF-SIMS:
 
    # Generate plots
    evaluator.plot()
+
+``NormalizationEvaluator`` accepts directories, file paths, and glob patterns.
+When a directory is given it will load both traditional ``.txt`` spectra and
+baseline-corrected ``.csv`` spectra.
+
+Notebook Workflow
+-----------------
+
+For baseline-corrected CSV cohorts with non-identical native m/z axes, use the
+repository notebook ``NoteBooks/_06_Normalization.ipynb``. It:
+
+- builds a shared m/z grid before evaluation
+- supports ``linear``, ``pchip``, ``akima``, ``makima`` (SciPy >= 1.13), and
+  ``cubic`` resampling
+- includes ``mass_stratified_pqn`` in the default evaluation set
+- enables ``multi_ion_reference`` when ``multi_ion_reference_mz`` is provided
+- exports the winning method to a timestamped normalized output folder
 
 **Metrics computed:**
 
@@ -302,6 +384,8 @@ API Reference
 
 .. autofunction:: mioXpektron.normalization.snv_normalization
 
+.. autofunction:: mioXpektron.normalization.robust_snv_normalization
+
 .. autofunction:: mioXpektron.normalization.poisson_scaling
 
 .. autofunction:: mioXpektron.normalization.sqrt_normalization
@@ -314,9 +398,15 @@ API Reference
 
 .. autofunction:: mioXpektron.normalization.selected_ion_normalization
 
+.. autofunction:: mioXpektron.normalization.multi_ion_reference_normalization
+
 .. autofunction:: mioXpektron.normalization.pqn_normalization
 
+.. autofunction:: mioXpektron.normalization.mass_stratified_pqn_normalization
+
 .. autofunction:: mioXpektron.normalization.median_of_ratios_normalization
+
+.. autofunction:: mioXpektron.normalization.pareto_normalization
 
 .. autoclass:: mioXpektron.normalization.NormalizationEvaluator
    :members:

@@ -36,8 +36,15 @@ Features:
 
 - Automatic decomposition level selection
 - Multiple threshold strategies (SURE, BayesShrink, VisuShrink, Universal)
-- Variance-Stabilizing Transform (VST) for Poisson-like noise
+- Variance-Stabilizing Transform (VST) for non-negative Poisson-like noise
 - Cycle-spinning for shift-invariant denoising
+
+When ``variance_stabilize="anscombe"``, the implementation uses the classical
+Anscombe forward transform together with the Mäkitalo-Foi unbiased inverse for
+the same classical transform. This is appropriate for pure Poisson-like,
+non-negative intensities. Negative values are not silently accepted anymore;
+use ``anscombe_negative_policy="warn_clip"`` for backward-compatible clipping
+or ``"raise"`` for strict handling.
 
 Gaussian Filter
 ^^^^^^^^^^^^^^^

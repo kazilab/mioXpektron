@@ -10,6 +10,8 @@ or combined through the :doc:`../pipeline`.
 
    * - Module
      - Description
+   * - :doc:`adaptive`
+     - Data-driven estimation of pipeline parameters (opt-in ``auto_tune``)
    * - :doc:`baseline`
      - Baseline correction using 20+ algorithms, batch correction, and method evaluation
    * - :doc:`denoise`
@@ -19,7 +21,7 @@ or combined through the :doc:`../pipeline`.
    * - :doc:`calibration`
      - Channel-to-m/z calibration with linear, quadratic, and reflectron TOF models
    * - :doc:`normalization`
-     - 14 normalization methods (TIC, Poisson, SNV, PQN, ...) with method evaluation
+     - 18 normalization methods including robust SNV, multi-ion reference, mass-stratified PQN, and method evaluation
    * - :doc:`plotting`
      - Publication-ready spectrum and peak visualization
    * - :doc:`utils`
@@ -31,6 +33,9 @@ Data Flow
 A typical mioXpektron workflow follows this data flow::
 
    Raw Spectrum Files
+        |
+        v
+   [Optional] Adaptive Parameter Estimation (auto_tune=True)
         |
         v
    [Optional] Auto-Calibration (Channel -> m/z)
@@ -56,6 +61,7 @@ A typical mioXpektron workflow follows this data flow::
 .. toctree::
    :hidden:
 
+   adaptive
    baseline
    denoise
    detection
