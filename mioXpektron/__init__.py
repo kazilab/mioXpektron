@@ -1,6 +1,6 @@
 """Public package interface for the Xpektron toolkit."""
 
-__version__ = "0.0.3"
+__version__ = "0.0.4"
 
 # Core imports (always work)
 from . import recalibrate, utils
