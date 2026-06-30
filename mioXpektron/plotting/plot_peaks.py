@@ -498,7 +498,7 @@ class PlotPeaks:
         ax.set_xlabel("m/z")
         ax.set_ylabel(
             "Normalized intensity" if self.config.norm_tic
-            else "Intensity (scaled ×1e6)"
+            else "Intensity"
         )
 
         # Title with counts
