@@ -96,6 +96,52 @@ from .recalibrate import (
 from .utils import import_data
 
 try:
+    from . import analysis
+    from .analysis import (
+        AnalysisConfig,
+        AnalysisWorkflow,
+        bh_fdr,
+        calculate_multiclass_metrics,
+        compare_model_results,
+        compute_univariate_tests,
+        evaluate_all_models,
+        get_benchmark_models,
+        infer_feature_columns,
+        plot_confusion_matrix,
+        plot_heatmap_top_features,
+        plot_pca,
+        plot_tsne,
+        plot_umap,
+        plot_volcano,
+        run_embeddings,
+        analysis_capabilities,
+        prepare_matrix,
+        prepare_ml_data,
+        run_analysis,
+        run_cnmf,
+        run_multi_dataset_comparison,
+        tune_top_models,
+    )
+except ImportError:
+    analysis = None
+    AnalysisConfig = None
+    AnalysisWorkflow = None
+    evaluate_all_models = None
+    get_benchmark_models = None
+    plot_tsne = None
+    plot_umap = None
+    run_embeddings = None
+    analysis_capabilities = None
+    prepare_ml_data = None
+    run_analysis = None
+    run_cnmf = None
+    calculate_multiclass_metrics = None
+    compare_model_results = None
+    plot_confusion_matrix = None
+    run_multi_dataset_comparison = None
+    tune_top_models = None
+
+try:
     from .pipeline import run_pipeline, PipelineConfig, DEFAULT_REFERENCE_MASSES
 except ImportError:
     run_pipeline = None
@@ -119,6 +165,30 @@ except ImportError:
     auto_tune_calib_config = None
 
 __all__ = [
+    "analysis",
+    "AnalysisConfig",
+    "AnalysisWorkflow",
+    "bh_fdr",
+    "compute_univariate_tests",
+    "evaluate_all_models",
+    "get_benchmark_models",
+    "infer_feature_columns",
+    "plot_heatmap_top_features",
+    "plot_pca",
+    "plot_tsne",
+    "plot_umap",
+    "run_embeddings",
+    "analysis_capabilities",
+    "plot_volcano",
+    "prepare_matrix",
+    "prepare_ml_data",
+    "run_analysis",
+    "run_cnmf",
+    "calculate_multiclass_metrics",
+    "compare_model_results",
+    "plot_confusion_matrix",
+    "run_multi_dataset_comparison",
+    "tune_top_models",
     "AggregateParams",
     "BaselineBatchCorrector",
     "BaselineMethodEvaluator",
