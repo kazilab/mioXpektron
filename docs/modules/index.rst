@@ -24,8 +24,10 @@ or combined through the :doc:`../pipeline`.
      - 18 normalization methods including robust SNV, multi-ion reference, mass-stratified PQN, and method evaluation
    * - :doc:`plotting`
      - Publication-ready spectrum and peak visualization
+   * - :doc:`analysis`
+     - Matrix preparation, univariate testing, and exploratory plots
    * - :doc:`utils`
-     - File I/O, data import, batch processing, and statistical analysis
+     - File I/O, data import, and batch processing
 
 Data Flow
 ---------
@@ -57,6 +59,9 @@ A typical mioXpektron workflow follows this data flow::
         |
         v
    Output: Intensity & Area Matrices
+        |
+        v
+   Statistical Analysis (univariate tests, PCA, volcano plots)
 
 .. toctree::
    :hidden:
@@ -68,4 +73,5 @@ A typical mioXpektron workflow follows this data flow::
    calibration
    normalization
    plotting
+   analysis
    utils

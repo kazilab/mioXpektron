@@ -48,36 +48,9 @@ Run parallel peak extraction and alignment across many spectra:
 Statistical Analysis
 --------------------
 
-The analysis submodule provides tools for downstream statistical analysis of
-aligned peak matrices.
-
-Benjamini-Hochberg FDR Correction
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-.. code-block:: python
-
-   from mioXpektron.utils.analysis import bh_fdr
-
-   q_values = bh_fdr(p_values)
-
-Univariate Testing
-^^^^^^^^^^^^^^^^^^
-
-.. code-block:: python
-
-   from mioXpektron.utils.analysis import compute_univariate_tests
-
-   results = compute_univariate_tests(intensity_df, groups)
-
-Visualization Helpers
-^^^^^^^^^^^^^^^^^^^^^
-
-The analysis module includes plotting utilities for:
-
-- Volcano plots
-- PCA and UMAP projections
-- ROC curves
-- Heatmaps
+Downstream statistical analysis lives in the dedicated :doc:`analysis` module.
+Import from ``mioXpektron.analysis`` (or the top-level package) rather than
+``mioXpektron.utils.analysis``, which is deprecated.
 
 API Reference
 -------------
