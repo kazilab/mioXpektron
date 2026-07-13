@@ -5,6 +5,13 @@ All notable changes to mioXpektron are documented here.
 
 The format follows `Keep a Changelog <https://keepachangelog.com/>`_.
 
+0.0.4 (2026-07-12)
+-------------------
+
+**Added**
+
+- ``analysis`` module.
+
 0.0.3 (2026-03-31)
 -------------------
 
