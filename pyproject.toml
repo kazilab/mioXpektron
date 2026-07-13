@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mioXpektron"
-version = "0.0.3"
+version = "0.0.4"
 description = "A comprehensive Time-of-Flight Secondary Ion Mass Spectrometry (ToF-SIMS) data processing toolkit"
 readme = "README.md"
 requires-python = ">=3.10"
