@@ -77,4 +77,4 @@ After installing, verify that mioXpektron is available:
 
    import mioXpektron as mx
    print(mx.__version__)
-   # 0.0.3
+   # 0.0.4

@@ -1,17 +1,33 @@
 """Sphinx configuration for mioXpektron documentation."""
 
+import importlib.util
 import os
 import sys
+from pathlib import Path
 
 # Add the package root to sys.path so autodoc can find the modules.
-sys.path.insert(0, os.path.abspath(".."))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+
+def _load_project_metadata():
+    metadata_path = ROOT / "mioXpektron" / "_metadata.py"
+    spec = importlib.util.spec_from_file_location("_mioxpektron_metadata", metadata_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load project metadata from {metadata_path}")
+    metadata = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(metadata)
+    return metadata
+
+
+_metadata = _load_project_metadata()
 
 # -- Project information -----------------------------------------------------
 
-project = "mioXpektron"
-copyright = "2026, @kazilab.se"
-author = "Data Analysis Team @KaziLab.se"
-release = "0.0.4"
+project = _metadata.PROJECT_NAME
+copyright = _metadata.COPYRIGHT
+author = _metadata.AUTHOR
+release = _metadata.VERSION
 
 # -- General configuration ---------------------------------------------------
 

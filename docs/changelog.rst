@@ -98,7 +98,7 @@ The format follows `Keep a Changelog <https://keepachangelog.com/>`_.
 **Changed**
 
 - Synchronized package and documentation release metadata to ``0.0.2``
-- Updated maintainer attribution to ``Data Analysis Team @KaziLab.se``
+- Updated maintainer attribution to ``Data Analysis Team @kazilab.se``
 - Standardized contact metadata to ``mioxpektron@kazilab.se``
 
 0.0.1 (2025)
