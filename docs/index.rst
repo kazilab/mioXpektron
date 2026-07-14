@@ -54,13 +54,15 @@ See the :doc:`quickstart` guide for a full walkthrough.
    :caption: Module Reference
 
    modules/adaptive
+   modules/analysis
    modules/baseline
+   modules/calibration
    modules/denoise
    modules/detection
-   modules/calibration
    modules/normalization
    modules/plotting
    modules/utils
+   modules/index
 
 .. toctree::
    :maxdepth: 1
