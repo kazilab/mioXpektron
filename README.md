@@ -291,9 +291,12 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Maintainer
 
-- **Developed by**: Data Analysis Team @KaziLab.se
+- **Developed by**: Data Analysis Team @kazilab.se
 - **Contact**: mioxpektron@kazilab.se
-- **Copyright**: @kazilab.se
+- **Copyright**: Data Analysis Team @kazilab.se
+
+Metadata values are sourced from `mioXpektron/_metadata.py`; run
+`python tools/sync_metadata.py` after editing that file.
 
 ## License
 
@@ -305,7 +308,7 @@ If you use mioXpektron in your research, please cite:
 
 ```bibtex
 @software{mioxpektron,
-  author = {Data Analysis Team @KaziLab.se},
+  author = {Data Analysis Team @kazilab.se},
   title = {mioXpektron: A ToF-SIMS Data Processing Toolkit},
   year = {2026},
   url = {https://github.com/kazilab/mioXpektron}
