@@ -4,16 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mioXpektron"
-version = "0.0.4"
+dynamic = ["version"]
 description = "A comprehensive Time-of-Flight Secondary Ion Mass Spectrometry (ToF-SIMS) data processing toolkit"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [
-    {name = "Data Analysis Team @KaziLab.se", email = "mioxpektron@kazilab.se"}
+    {name = "Data Analysis Team @kazilab.se", email = "mioxpektron@kazilab.se"}
 ]
 maintainers = [
-    {name = "Data Analysis Team @KaziLab.se", email = "mioxpektron@kazilab.se"}
+    {name = "Data Analysis Team @kazilab.se", email = "mioxpektron@kazilab.se"}
 ]
 keywords = [
     "mass-spectrometry",
@@ -84,6 +84,9 @@ exclude = ["mioXpektron.recalibrate._deprecated*"]
 [tool.setuptools.package-data]
 mioXpektron = ["py.typed", "**/*.md"]
 
+[tool.setuptools.dynamic]
+version = {attr = "mioXpektron._metadata.VERSION"}
+
 [tool.black]
 line-length = 88
 target-version = ['py310', 'py311', 'py312', 'py313']
@@ -99,6 +102,6 @@ warn_unused_configs = true
 disallow_untyped_defs = false
 
 [tool.pytest.ini_options]
-testpaths = ["mioXpektron"]
+testpaths = ["mioXpektron", "tests"]
 python_files = ["test_*.py"]
 addopts = "-v --cov=mioXpektron --cov-report=term-missing"
